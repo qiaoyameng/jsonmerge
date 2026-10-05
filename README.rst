@@ -267,6 +267,37 @@ arrayMergeById
   *JSON pointer*. The pointer is resolved in the same way as *idRef*. Sort
   order can be reversed by setting the *sortReverse* option.
 
+  When *base* and *head* each insert different items into different
+  positions, neither keeping the *base* order nor *sortByRef* can preserve
+  the local order of both sides. The *beforeAfter* merge option can be used
+  to declare explicit ordering relations that the resulting array must
+  satisfy. It is an object with optional *before* and *after* mappings.
+  Each mapping maps an item ID to a list of item IDs::
+
+      "mergeOptions": {
+          "beforeAfter": {
+              "before": {"b": ["c"]},
+              "after": {"c": ["a"]}
+          }
+      }
+
+  In the *before* mapping the key item must appear before every listed
+  item, while in the *after* mapping it must appear after every listed
+  item. Item contents are merged by the usual *arrayMergeById* rules
+  first; the resulting array is then reordered so that all relations hold.
+  Items not involved in any relation keep their stable position: items
+  present in *base* come first in their *base* order, items newly
+  introduced by *head* follow in *head* order. The option can be passed
+  either through *mergeOptions* in the schema or via the *merge_options*
+  argument of the *merge* method; the relations never become part of the
+  merged items.
+
+  A *SchemaError* is raised if a relation references an item ID that is
+  not present in the merged array, or if the relations form a cycle. The
+  error message for a cycle lists each edge of one offending cycle (e.g.
+  ``a before b -> b before c -> c before a``), so it can be checked
+  edge by edge. *beforeAfter* cannot be combined with *sortByRef*.
+
 arrayMergeByIndex
   Merge array items by their index in the array. Similarly to
   *arrayMergeById* strategy, the resulting arrays have items from both

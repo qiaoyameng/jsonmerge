@@ -1326,6 +1326,207 @@ class TestMerge(unittest.TestCase):
         base = merger.merge(base, head)
         self.assertEqual(base, expected)
 
+    def test_merge_by_id_before_after_two_sides_insert(self):
+        # Base and head each insert a different item; the beforeAfter
+        # constraints place each insert relative to items shared by both
+        # sides, so both local orders are preserved.
+        schema = {
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": {
+                "beforeAfter": {
+                    # head's local order: y is inserted before a
+                    "before": {"y": ["a"], "x": ["c"]},
+                    # base's local order: x is inserted between a and c
+                    "after": {"x": ["a"]},
+                }
+            }
+        }
+
+        # base inserts x between a and c
+        base = [
+            {"id": "a"},
+            {"id": "x"},
+            {"id": "c"},
+        ]
+
+        # head inserts y before a
+        head = [
+            {"id": "y"},
+            {"id": "a"},
+            {"id": "c"},
+        ]
+
+        expected = [
+            {"id": "y"},
+            {"id": "a"},
+            {"id": "x"},
+            {"id": "c"},
+        ]
+
+        merger = jsonmerge.Merger(schema)
+        result = merger.merge(base, head)
+        self.assertEqual(result, expected)
+
+        # every declared relation (and its transitive consequences) survives
+        result_ids = [item["id"] for item in result]
+        self.assertLess(result_ids.index("y"), result_ids.index("a"))
+        self.assertLess(result_ids.index("a"), result_ids.index("x"))
+        self.assertLess(result_ids.index("x"), result_ids.index("c"))
+        self.assertLess(result_ids.index("y"), result_ids.index("c"))
+
+        # without the constraints, plain base-first/head-append order applies
+        # and breaks the relation declared by head (y before a)
+        unconstrained = jsonmerge.Merger({"mergeStrategy": "arrayMergeById"})
+        plain = unconstrained.merge(base, head)
+        self.assertEqual([item["id"] for item in plain], ["a", "x", "c", "y"])
+
+    def test_merge_by_id_before_after_unconstrained_stable(self):
+        # No constraints at all: base items keep their order, then head's
+        # new items in head order.
+        schema = {
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": {"beforeAfter": {}}
+        }
+
+        base = [
+            {"id": "a"},
+            {"id": "c"},
+        ]
+
+        head = [
+            {"id": "b"},
+            {"id": "a"},
+        ]
+
+        merger = jsonmerge.Merger(schema)
+        result = merger.merge(base, head)
+        self.assertEqual([item["id"] for item in result], ["a", "c", "b"])
+
+    def test_merge_by_id_before_after_missing_id(self):
+        schema = {
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": {"beforeAfter": {"before": {"a": ["z"]}}}
+        }
+
+        base = [{"id": "a"}]
+        head = [{"id": "b"}]
+
+        merger = jsonmerge.Merger(schema)
+        with self.assertRaises(SchemaError) as cm:
+            merger.merge(base, head)
+
+        self.assertIn("z", str(cm.exception))
+
+    def test_merge_by_id_before_after_three_item_cycle(self):
+        schema = {
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": {
+                "beforeAfter": {
+                    "before": {
+                        "a": ["b"],
+                        "b": ["c"],
+                        "c": ["a"],
+                    }
+                }
+            }
+        }
+
+        base = [
+            {"id": "a"},
+            {"id": "b"},
+            {"id": "c"},
+        ]
+        head = []
+
+        merger = jsonmerge.Merger(schema)
+        with self.assertRaises(SchemaError) as cm:
+            merger.merge(base, head)
+
+        message = str(cm.exception)
+        self.assertIn("cycle", message)
+        # the message lists one edge per hop, closing back on itself
+        self.assertIn("a before b", message)
+        self.assertIn("b before c", message)
+        self.assertIn("c before a", message)
+
+    def test_merge_by_id_before_after_self_cycle(self):
+        schema = {
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": {"beforeAfter": {"after": {"a": ["a"]}}}
+        }
+
+        base = [{"id": "a"}]
+        head = []
+
+        merger = jsonmerge.Merger(schema)
+        with self.assertRaises(SchemaError) as cm:
+            merger.merge(base, head)
+
+        self.assertIn("a before a", str(cm.exception))
+
+    def test_merge_by_id_before_after_via_merge_options_arg(self):
+        # ordering metadata is supplied through the call argument, not the
+        # business objects or the schema
+        schema = {
+            "mergeStrategy": "arrayMergeById",
+            "items": {
+                "properties": {
+                    "id": {"type": "string"},
+                }
+            }
+        }
+
+        base = [{"id": "a"}, {"id": "b"}]
+        head = [{"id": "c"}, {"id": "a"}]
+
+        merger = jsonmerge.Merger(schema)
+        result = merger.merge(base, head, merge_options={
+            "arrayMergeById": {
+                "beforeAfter": {"before": {"c": ["a"]}}
+            }
+        })
+
+        result_ids = [item["id"] for item in result]
+        # declared relation holds; the unconstrained base item keeps its
+        # stable fallback position
+        self.assertLess(result_ids.index("c"), result_ids.index("a"))
+        self.assertEqual(result_ids, ["b", "c", "a"])
+        # ordering metadata never leaks into the business objects
+        self.assertNotIn("before", result[0])
+
+    def test_merge_by_id_before_after_bad_value(self):
+        schema = {
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": {"beforeAfter": {"before": {"a": [None]}}}
+        }
+
+        merger = jsonmerge.Merger(schema)
+        with self.assertRaises(SchemaError):
+            merger.merge([{"id": "a"}], [])
+
+    def test_merge_by_id_before_after_scalar_value_rejected(self):
+        schema = {
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": {"beforeAfter": {"before": {"b": "a"}}}
+        }
+
+        merger = jsonmerge.Merger(schema)
+        with self.assertRaises(SchemaError):
+            merger.merge([{"id": "a"}, {"id": "b"}], [])
+
+    def test_merge_by_id_before_after_with_sortbyref(self):
+        schema = {
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": {
+                "beforeAfter": {"before": {"a": ["b"]}},
+                "sortByRef": "id",
+            }
+        }
+
+        merger = jsonmerge.Merger(schema)
+        with self.assertRaises(SchemaError):
+            merger.merge([{"id": "a"}, {"id": "b"}], [])
+
     def test_merge_by_id_subclass_get_key(self):
 
         class MyArrayMergeById(jsonmerge.strategies.ArrayMergeById):
