@@ -1,3 +1,15 @@
+2026-10-05	jsonmerge
+	* Add "strict_strategy_resolution" argument to the Merger
+	  constructor. When enabled, all schema rules matching an object
+	  property (from "properties" and "patternProperties") are
+	  collected: rules with the same merge strategy and compatible
+	  merge options are coalesced so that the result does not depend
+	  on declaration order, while conflicting rules raise a SchemaError
+	  reporting the location of every conflicting rule before anything
+	  is merged. "additionalProperties" is only used when no rule
+	  matches. The same resolution applies to nested objects, schemas
+	  behind "$ref" and the get_schema() method.
+
 2023-07-19	jsonmerge	1.9.2
 	* Fix failing tests with jsonschema>=4.18.0.
 

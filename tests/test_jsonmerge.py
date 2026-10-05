@@ -1653,6 +1653,306 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(result, [ {'c': 2}, {'d': 3} ])
 
 
+class TestStrictStrategyResolution(unittest.TestCase):
+
+    def make_schemas_swapped(self, schema):
+        # Return a copy of schema with patternProperties declared in
+        # reverse order.
+        schema = dict(schema)
+        patterns = schema.get('patternProperties')
+        if patterns is not None:
+            schema['patternProperties'] = dict(
+                    reversed(list(patterns.items())))
+        return schema
+
+    def test_non_strict_last_match_wins(self):
+        # Without strict resolution, the last matching patternProperty
+        # silently wins and the result depends on declaration order.
+        schema = {'mergeStrategy': 'objectMerge',
+                  'patternProperties': {
+                      '^a': {'mergeStrategy': 'append'},
+                      'b$': {'mergeStrategy': 'overwrite'},
+                  }}
+
+        merger = jsonmerge.Merger(schema)
+        base = merger.merge(None, {'ab': ["x"]})
+        base = merger.merge(base, {'ab': ["y"]})
+        self.assertEqual(base, {'ab': ["y"]})
+
+        merger = jsonmerge.Merger(self.make_schemas_swapped(schema))
+        base = merger.merge(None, {'ab': ["x"]})
+        base = merger.merge(base, {'ab': ["y"]})
+        self.assertEqual(base, {'ab': ["x", "y"]})
+
+    def test_strict_coalesce_order_independent(self):
+        # Both patterns require the same strategy, so the rules are
+        # coalesced and declaration order must not matter.
+        schema = {'mergeStrategy': 'objectMerge',
+                  'patternProperties': {
+                      '^a': {'mergeStrategy': 'append'},
+                      'b$': {'mergeStrategy': 'append'},
+                  }}
+
+        results = []
+        for s in (schema, self.make_schemas_swapped(schema)):
+            merger = jsonmerge.Merger(s, strict_strategy_resolution=True)
+            base = merger.merge(None, {'ab': ["x"]})
+            base = merger.merge(base, {'ab': ["y"]})
+            results.append(base)
+
+        self.assertEqual(results[0], {'ab': ["x", "y"]})
+        self.assertEqual(results[0], results[1])
+
+    def test_strict_coalesce_properties_and_pattern(self):
+        schema = {'mergeStrategy': 'objectMerge',
+                  'properties': {
+                      'ab': {'mergeStrategy': 'append'},
+                  },
+                  'patternProperties': {
+                      '^a': {'mergeStrategy': 'append'},
+                  }}
+
+        merger = jsonmerge.Merger(schema, strict_strategy_resolution=True)
+        base = merger.merge(None, {'ab': ["x"]})
+        base = merger.merge(base, {'ab': ["y"]})
+
+        self.assertEqual(base, {'ab': ["x", "y"]})
+
+    def test_strict_coalesce_compatible_options(self):
+        # Same strategy, disjoint merge options: options are merged.
+        schema = {'mergeStrategy': 'objectMerge',
+                  'properties': {
+                      'ab': {'mergeStrategy': 'version',
+                             'mergeOptions': {'limit': 2}},
+                  },
+                  'patternProperties': {
+                      '^a': {'mergeStrategy': 'version'},
+                  }}
+
+        merger = jsonmerge.Merger(schema, strict_strategy_resolution=True)
+        base = None
+        for v in ("a", "b", "c"):
+            base = merger.merge(base, {'ab': v})
+
+        self.assertEqual(base, {'ab': [{'value': "b"}, {'value': "c"}]})
+
+    def test_strict_conflict_patterns(self):
+        schema = {'mergeStrategy': 'objectMerge',
+                  'patternProperties': {
+                      '^a': {'mergeStrategy': 'append'},
+                      'b$': {'mergeStrategy': 'overwrite'},
+                  }}
+
+        for s in (schema, self.make_schemas_swapped(schema)):
+            merger = jsonmerge.Merger(s, strict_strategy_resolution=True)
+
+            with self.assertRaises(SchemaError) as cm:
+                merger.merge(None, {'ab': ["x"]})
+
+            msg = str(cm.exception)
+            self.assertIn("'ab'", msg)
+            self.assertIn('append', msg)
+            self.assertIn('overwrite', msg)
+            self.assertIn('#/patternProperties/^a', msg)
+            self.assertIn('#/patternProperties/b$', msg)
+
+    def test_strict_conflict_properties_and_pattern(self):
+        schema = {'mergeStrategy': 'objectMerge',
+                  'properties': {
+                      'ab': {'mergeStrategy': 'append'},
+                  },
+                  'patternProperties': {
+                      '^a': {'mergeStrategy': 'overwrite'},
+                  }}
+
+        merger = jsonmerge.Merger(schema, strict_strategy_resolution=True)
+
+        with self.assertRaises(SchemaError) as cm:
+            merger.merge(None, {'ab': ["x"]})
+
+        msg = str(cm.exception)
+        self.assertIn('#/properties/ab', msg)
+        self.assertIn('#/patternProperties/^a', msg)
+
+    def test_strict_conflict_options(self):
+        schema = {'mergeStrategy': 'objectMerge',
+                  'patternProperties': {
+                      '^a': {'mergeStrategy': 'version',
+                             'mergeOptions': {'limit': 2}},
+                      'b$': {'mergeStrategy': 'version',
+                             'mergeOptions': {'limit': 3}},
+                  }}
+
+        merger = jsonmerge.Merger(schema, strict_strategy_resolution=True)
+
+        with self.assertRaises(SchemaError) as cm:
+            merger.merge(None, {'ab': "x"})
+
+        msg = str(cm.exception)
+        self.assertIn('limit', msg)
+        self.assertIn('#/patternProperties/^a', msg)
+        self.assertIn('#/patternProperties/b$', msg)
+
+    def test_strict_conflict_before_modification(self):
+        # The conflict must be reported before anything is merged, even
+        # if another property in the same object would merge cleanly.
+        schema = {'mergeStrategy': 'objectMerge',
+                  'properties': {
+                      'ok': {'mergeStrategy': 'append'},
+                  },
+                  'patternProperties': {
+                      '^a': {'mergeStrategy': 'append'},
+                      'b$': {'mergeStrategy': 'overwrite'},
+                  }}
+
+        merger = jsonmerge.Merger(schema, strict_strategy_resolution=True)
+
+        base = {'ok': ["orig"], 'ab': ["orig"]}
+        head = {'ok': ["new"], 'ab': ["new"]}
+
+        with self.assertRaises(SchemaError):
+            merger.merge(base, head)
+
+        self.assertEqual(base, {'ok': ["orig"], 'ab': ["orig"]})
+        self.assertEqual(head, {'ok': ["new"], 'ab': ["new"]})
+
+    def test_strict_additional_properties_only_when_no_match(self):
+        schema = {'mergeStrategy': 'objectMerge',
+                  'properties': {
+                      'b': {'mergeStrategy': 'overwrite'},
+                  },
+                  'patternProperties': {
+                      '^a': {'mergeStrategy': 'append'},
+                  },
+                  'additionalProperties': {
+                      'mergeStrategy': 'version',
+                  }}
+
+        merger = jsonmerge.Merger(schema, strict_strategy_resolution=True)
+        base = merger.merge(None, {'a1': ["x"], 'b': ["x"], 'c': "x"})
+        base = merger.merge(base, {'a1': ["y"], 'b': ["y"], 'c': "y"})
+
+        self.assertEqual(base, {
+            'a1': ["x", "y"],
+            'b': ["y"],
+            'c': [{'value': "x"}, {'value': "y"}],
+        })
+
+    def test_strict_conflict_recursive(self):
+        schema = {'mergeStrategy': 'objectMerge',
+                  'properties': {
+                      'outer': {
+                          'mergeStrategy': 'objectMerge',
+                          'patternProperties': {
+                              '^a': {'mergeStrategy': 'append'},
+                              'b$': {'mergeStrategy': 'overwrite'},
+                          },
+                      },
+                  }}
+
+        merger = jsonmerge.Merger(schema, strict_strategy_resolution=True)
+
+        with self.assertRaises(SchemaError) as cm:
+            merger.merge(None, {'outer': {'ab': ["x"]}})
+
+        self.assertIn('#/properties/outer/patternProperties/^a', str(cm.exception))
+
+    def test_strict_conflict_ref(self):
+        schema = {'mergeStrategy': 'objectMerge',
+                  'properties': {
+                      'obj': {'$ref': '#/definitions/obj'},
+                  },
+                  'definitions': {
+                      'obj': {
+                          'mergeStrategy': 'objectMerge',
+                          'patternProperties': {
+                              '^a': {'mergeStrategy': 'append'},
+                              'b$': {'mergeStrategy': 'overwrite'},
+                          },
+                      },
+                  }}
+
+        merger = jsonmerge.Merger(schema, strict_strategy_resolution=True)
+
+        with self.assertRaises(SchemaError) as cm:
+            merger.merge(None, {'obj': {'ab': ["x"]}})
+
+        self.assertIn('#/definitions/obj/patternProperties/^a', str(cm.exception))
+
+    def test_strict_ref_coalesce(self):
+        schema = {'mergeStrategy': 'objectMerge',
+                  'properties': {
+                      'obj': {'$ref': '#/definitions/obj'},
+                  },
+                  'definitions': {
+                      'obj': {
+                          'mergeStrategy': 'objectMerge',
+                          'patternProperties': {
+                              '^a': {'mergeStrategy': 'append'},
+                              'b$': {'mergeStrategy': 'append'},
+                          },
+                      },
+                  }}
+
+        merger = jsonmerge.Merger(schema, strict_strategy_resolution=True)
+        base = merger.merge(None, {'obj': {'ab': ["x"]}})
+        base = merger.merge(base, {'obj': {'ab': ["y"]}})
+
+        self.assertEqual(base, {'obj': {'ab': ["x", "y"]}})
+
+    def test_strict_get_schema_conflict(self):
+        schema = {'properties': {
+                      'ab': {'mergeStrategy': 'append'},
+                  },
+                  'patternProperties': {
+                      'b$': {'mergeStrategy': 'overwrite'},
+                  }}
+
+        merger = jsonmerge.Merger(schema, strict_strategy_resolution=True)
+
+        with self.assertRaises(SchemaError) as cm:
+            merger.get_schema()
+
+        msg = str(cm.exception)
+        self.assertIn('#/properties/ab', msg)
+        self.assertIn('#/patternProperties/b$', msg)
+
+    def test_strict_get_schema_coalesce(self):
+        schema = {'properties': {
+                      'ab': {'mergeStrategy': 'version'},
+                  },
+                  'patternProperties': {
+                      '^a': {'mergeStrategy': 'version'},
+                  }}
+
+        merger = jsonmerge.Merger(schema, strict_strategy_resolution=True)
+        schema2 = merger.get_schema()
+
+        self.assertEqual(schema2['properties']['ab'], {
+            'type': 'array',
+            'items': {
+                'properties': {
+                    'value': {},
+                },
+            },
+        })
+
+    def test_non_strict_get_schema_unchanged(self):
+        # Without strict resolution, get_schema does not report
+        # conflicts between properties and patternProperties.
+        schema = {'properties': {
+                      'ab': {'mergeStrategy': 'append'},
+                  },
+                  'patternProperties': {
+                      'b$': {'mergeStrategy': 'overwrite'},
+                  }}
+
+        merger = jsonmerge.Merger(schema)
+        schema2 = merger.get_schema()
+
+        self.assertEqual(schema2['properties']['ab'], {})
+
+
 class TestGetSchema(unittest.TestCase):
 
     def test_default_overwrite(self):

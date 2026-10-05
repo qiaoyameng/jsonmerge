@@ -7,6 +7,7 @@ from jsonmerge import descenders
 from jsonmerge.exceptions import SchemaError, JSONMergeError
 from jsonschema.validators import Draft4Validator
 import logging
+import re
 import warnings
 
 log = logging.getLogger(name=__name__)
@@ -48,8 +49,9 @@ class Walk(object):
         log.debug("descend: %sschema %s" % (self._indent(), schema.ref,))
 
         if not schema.is_undef():
-            with self.resolver.resolving(schema.ref) as resolved:
-                assert schema.val is resolved
+            if not schema.synthetic:
+                with self.resolver.resolving(schema.ref) as resolved:
+                    assert schema.val is resolved
 
         # backwards compatibility jsonmerge<=1.6.0
         opts = {'meta': None}
@@ -91,6 +93,115 @@ class Walk(object):
 
         self.lvl -= 1
         return rv
+
+    def get_property_subschema(self, schema, key, *args):
+        """Resolve the subschema that applies to an object property.
+
+        schema -- Schema of the object (JSONValue), possibly containing
+            'properties', 'patternProperties' and 'additionalProperties'
+            keywords.
+        key -- Name of the property in the instance.
+        args -- Extra arguments for default_strategy() (base and head
+            for WalkInstance, none for WalkSchema).
+
+        All rules from 'properties' and 'patternProperties' that match
+        the property name are collected. Rules that use the same merge
+        strategy with compatible merge options are coalesced into a
+        single subschema, so that the result does not depend on the
+        declaration order in the schema. If matching rules conflict,
+        SchemaError is raised reporting the location of every
+        conflicting rule. 'additionalProperties' is only used when no
+        rule matches the property name.
+        """
+        if schema.is_undef():
+            return JSONValue(undef=True)
+
+        matches = []
+
+        properties = schema.get('properties')
+        if not properties.is_undef():
+            subschema = properties.get(key)
+            if not subschema.is_undef():
+                matches.append(subschema)
+
+        patterns = schema.get('patternProperties')
+        if not patterns.is_undef():
+            for pattern, subschema in sorted(patterns.items(), key=lambda item: item[0]):
+                if re.search(pattern, key):
+                    matches.append(subschema)
+
+        if not matches:
+            additional = schema.get('additionalProperties')
+            # additionalProperties can be boolean in draft 4
+            if not additional.is_undef() and self.is_type(additional, "object"):
+                return additional
+            return JSONValue(undef=True)
+
+        if len(matches) == 1:
+            return matches[0]
+
+        return self._coalesce_property_rules(schema, key, matches, *args)
+
+    def _coalesce_property_rules(self, schema, key, matches, *args):
+        """Coalesce multiple matching property rules into one subschema.
+
+        Raises SchemaError if the matching rules require conflicting
+        merge strategies or incompatible merge options.
+        """
+        rules = []
+        for subschema in matches:
+            name = subschema.val.get("mergeStrategy")
+            explicit = name is not None
+            if not explicit:
+                name = self.default_strategy(subschema, *args)
+            options = subschema.val.get("mergeOptions")
+            if options is None:
+                options = {}
+            rules.append((subschema, name, options, explicit))
+
+        names = set(name for _, name, _, _ in rules)
+        if len(names) > 1:
+            details = ", ".join(
+                    "'%s' at %s" % (name, subschema.ref)
+                    for subschema, name, _, _ in rules)
+            raise SchemaError(
+                    "Conflicting merge strategies for property '%s': %s" % (key, details),
+                    schema)
+
+        name = rules[0][1]
+
+        options = {}
+        for subschema, _, sub_options, _ in rules:
+            for opt_name, opt_value in sub_options.items():
+                if opt_name in options and options[opt_name] != opt_value:
+                    details = ", ".join(s.ref for s, _, _, _ in rules)
+                    raise SchemaError(
+                            "Conflicting merge options for property '%s' ('%s' merge "
+                            "strategy): option '%s' differs between rules at %s" % (
+                                key, name, opt_name, details),
+                            schema)
+                options[opt_name] = opt_value
+
+        # Merge the matching subschemas into one. Iteration is ordered
+        # by schema location so that the result does not depend on the
+        # declaration order in the schema.
+        ordered = sorted(matches, key=lambda subschema: subschema.ref)
+
+        merged = {}
+        for subschema in ordered:
+            merged.update(subschema.val)
+
+        if any(explicit for _, _, _, explicit in rules):
+            merged["mergeStrategy"] = name
+        else:
+            merged.pop("mergeStrategy", None)
+
+        if options:
+            merged["mergeOptions"] = options
+        else:
+            merged.pop("mergeOptions", None)
+
+        return JSONValue(merged, ordered[0].ref, synthetic=True)
 
 class WalkInstance(Walk):
 
@@ -233,7 +344,7 @@ class Merger(object):
     }
 
     def __init__(self, schema, strategies=(), objclass_def='dict', objclass_menu=None,
-            validatorclass=Draft4Validator):
+            validatorclass=Draft4Validator, strict_strategy_resolution=False):
         """Create a new Merger object.
 
         schema -- JSON schema to use when merging.
@@ -258,9 +369,19 @@ class Merger(object):
         validatorclass argument can be used to supply a validator class from
         jsonschema. This can be used for example to specify which JSON Schema
         draft version will be used during merge.
+
+        If strict_strategy_resolution is true, all schema rules that match
+        an object property (from 'properties' and 'patternProperties') are
+        collected and checked for consistency before merging. Matching
+        rules with the same merge strategy and compatible merge options
+        are coalesced, so the result does not depend on the declaration
+        order in the schema. Conflicting rules raise a SchemaError that
+        reports the location of every conflicting rule before anything is
+        merged. By default (False), the last matching rule silently wins.
         """
 
         self.schema = schema
+        self.strict_strategy_resolution = strict_strategy_resolution
 
         if hasattr(validatorclass, 'ID_OF'):
             resolver = LocalRefResolver.from_schema(schema, id_of=validatorclass.ID_OF)

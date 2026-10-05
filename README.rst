@@ -360,6 +360,55 @@ validatorclass
     as reference resolution are different between versions. By default, the
     Draft 4 validator is used.
 
+strict_strategy_resolution
+   If true, all schema rules matching an object property (from
+   *properties* and *patternProperties*) are collected and checked for
+   consistency before merging. See the "Strict strategy resolution"
+   section below. Defaults to false.
+
+
+Strict strategy resolution
+--------------------------
+
+By default, when a property matches a rule in *properties* and one or
+more rules in *patternProperties*, only one of the matching rules is
+used: a *properties* rule takes precedence, and among matching
+*patternProperties* rules the one declared last silently wins. This
+makes the merge result depend on the declaration order in the schema.
+
+When the Merger is created with *strict_strategy_resolution* set to
+true, all rules that match a property are collected instead. Matching
+rules that use the same merge strategy with compatible merge options
+are coalesced into a single rule, so the result does not depend on the
+declaration order. Options are compatible when they don't set different
+values for the same option. If the matching rules require conflicting
+strategies or incompatible options, a *SchemaError* is raised that
+reports the schema location of every conflicting rule. The check is
+performed for all properties of an object before anything is merged, so
+a conflict is reported before any document is modified.
+*additionalProperties* is only used for properties that don't match any
+rule.
+
+The same resolution is applied everywhere property rules are consulted:
+when merging recursively nested objects, when descending through *$ref*
+references and when computing the result schema with *get_schema()*.
+
+Example::
+
+    >>> import jsonmerge
+    >>> schema = {
+    ...     'mergeStrategy': 'objectMerge',
+    ...     'patternProperties': {
+    ...         '^a': {'mergeStrategy': 'append'},
+    ...         'b$': {'mergeStrategy': 'overwrite'},
+    ...     }
+    ... }
+    >>> merger = jsonmerge.Merger(schema, strict_strategy_resolution=True)
+    >>> merger.merge(None, {'ab': ["x"]})
+    Traceback (most recent call last):
+    ...
+    jsonmerge.exceptions.SchemaError: 'objectMerge' merge strategy: Conflicting merge strategies for property 'ab': 'append' at #/patternProperties/^a, 'overwrite' at #/patternProperties/b$: #
+
 
 Support for keywords that apply subschemas
 ------------------------------------------

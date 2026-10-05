@@ -319,6 +319,9 @@ class ObjectMerge(Strategy):
 
             base = JSONValue(objcls(base.val), base.ref)
 
+        if walk.merger.strict_strategy_resolution:
+            return self._merge_strict(walk, base, head, schema)
+
         for k, v in head.items():
 
             subschema = JSONValue(undef=True)
@@ -346,6 +349,20 @@ class ObjectMerge(Strategy):
 
         return base
 
+    def _merge_strict(self, walk, base, head, schema):
+        # Resolve the subschema for every property up front. If any
+        # property matches conflicting rules, SchemaError is raised here,
+        # before anything is merged into base.
+        resolved = []
+        for k, v in head.items():
+            subschema = walk.get_property_subschema(schema, k, base.get(k), v)
+            resolved.append((k, v, subschema))
+
+        for k, v, subschema in resolved:
+            base[k] = walk.descend(subschema, base.get(k), v)
+
+        return base
+
     def get_schema(self, walk, schema, **kwargs):
         schema2 = JSONValue(dict(schema.val), schema.ref)
 
@@ -355,7 +372,18 @@ class ObjectMerge(Strategy):
                 for k, v in p.items():
                     schema2[keyword][k] = walk.descend(v)
 
-        descend_keyword("properties")
+        if walk.merger.strict_strategy_resolution:
+            # Run the same resolution as merge() for every literal
+            # property name, so that conflicts between 'properties' and
+            # 'patternProperties' rules are reported here as well.
+            p = schema.get("properties")
+            if not p.is_undef():
+                for k, v in p.items():
+                    schema2["properties"][k] = walk.descend(
+                            walk.get_property_subschema(schema, k))
+        else:
+            descend_keyword("properties")
+
         descend_keyword("patternProperties")
 
        # additionalProperties can be boolean in draft 4

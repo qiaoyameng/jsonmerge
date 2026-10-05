@@ -7,11 +7,14 @@ else:
     text_type = unicode
 
 class JSONValue(object):
-    def __init__(self, val=None, ref='#', undef=False):
+    def __init__(self, val=None, ref='#', undef=False, synthetic=False):
         assert not isinstance(val, JSONValue)
         self.val = val
         self.ref = ref
         self.undef = undef
+        # True if this value was synthesized by the merger itself (e.g.
+        # a coalesced subschema) and hence 'ref' does not resolve to it.
+        self.synthetic = synthetic
 
     def is_undef(self):
         return self.undef
