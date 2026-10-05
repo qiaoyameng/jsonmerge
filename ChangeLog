@@ -1,3 +1,11 @@
+2026-10-05	jsonmerge
+	* Add arrayMergeByIdWithDelete strategy. It merges a plain business
+	  array from a head object that keeps updated/new items and explicit
+	  delete directives in two separate arrays. Update and delete of the
+	  same ID in one head is rejected; deleting a missing ID can be
+	  ignored or raise an error with the errorOnMissingDelete option. ID
+	  comparison uses JSON type semantics (true is not equal to 1).
+
 2023-07-19	jsonmerge	1.9.2
 	* Fix failing tests with jsonschema>=4.18.0.
 

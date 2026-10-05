@@ -1653,6 +1653,305 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(result, [ {'c': 2}, {'d': 3} ])
 
 
+class TestMergeByIdWithDelete(unittest.TestCase):
+
+    schema = {
+        "properties": {
+            "awards": {
+                "type": "array",
+                "mergeStrategy": "arrayMergeByIdWithDelete",
+                "items": {
+                    "properties": {
+                        "id": {"type": "string"},
+                        "field": {"type": "number"},
+                    }
+                }
+            }
+        }
+    }
+
+    def test_update_insert_delete(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        base = None
+        base = merger.merge(base, {"awards": {"items": [
+            {"id": "A", "field": 1},
+            {"id": "B", "field": 2},
+            {"id": "C", "field": 3},
+        ]}})
+
+        # Update B, insert D, delete A (plus a delete for a non-existent ID,
+        # which is ignored by default).
+        base = merger.merge(base, {"awards": {
+            "items": [
+                {"id": "B", "field": 20},
+                {"id": "D", "field": 4},
+            ],
+            "deletes": ["A", "ZZZ"],
+        }})
+
+        # Survivors keep their original order; new items follow in head order.
+        self.assertEqual(base, {"awards": [
+            {"id": "B", "field": 20},
+            {"id": "C", "field": 3},
+            {"id": "D", "field": 4},
+        ]})
+
+    def test_result_is_plain_business_array(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        base = merger.merge(None, {"awards": {
+            "items": [{"id": "A", "field": 1}],
+            "deletes": ["B"],
+        }})
+
+        # The instruction envelope must not leak into the merged document.
+        self.assertEqual(base, {"awards": [{"id": "A", "field": 1}]})
+        self.assertNotIn("items", base["awards"])
+        self.assertNotIn("deletes", base["awards"])
+
+    def test_delete_only_batch(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        base = {"awards": [
+            {"id": "A", "field": 1},
+            {"id": "B", "field": 2},
+        ]}
+
+        base = merger.merge(base, {"awards": {"deletes": ["A"]}})
+
+        self.assertEqual(base, {"awards": [{"id": "B", "field": 2}]})
+
+    def test_items_only_batch(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        base = merger.merge(None, {"awards": {"items": [
+            {"id": "A", "field": 1}]}})
+
+        self.assertEqual(base, {"awards": [{"id": "A", "field": 1}]})
+
+    def test_null_and_same_named_field_are_not_tombstones(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        base = {"awards": [
+            {"id": "A", "field": 1},
+            {"id": "B", "field": 2},
+            {"id": "C", "field": 3},
+        ]}
+
+        # A literal null among items and a business field named 'deletes' must
+        # not delete anything; the business field is preserved as-is.
+        base = merger.merge(base, {"awards": {"items": [
+            None,
+            {"id": "A", "field": 10, "deletes": ["B", "C"]},
+        ]}})
+
+        self.assertEqual(base, {"awards": [
+            {"id": "A", "field": 10, "deletes": ["B", "C"]},
+            {"id": "B", "field": 2},
+            {"id": "C", "field": 3},
+        ]})
+
+    def test_update_and_delete_same_id_rejected(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        base = {"awards": [{"id": "A", "field": 1}]}
+
+        with self.assertRaises(HeadInstanceError) as cm:
+            merger.merge(base, {"awards": {
+                "items": [{"id": "A", "field": 2}],
+                "deletes": ["A"],
+            }})
+
+        self.assertEqual(cm.exception.value.ref, "#/awards/deletes/0")
+
+    def test_update_and_delete_same_id_rejected_even_if_missing(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(None, {"awards": {
+                "items": [{"id": "A", "field": 1}],
+                "deletes": ["A"],
+            }})
+
+    def test_delete_missing_id_ignored_by_default(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        base = {"awards": [{"id": "A", "field": 1}]}
+
+        base = merger.merge(base, {"awards": {"deletes": ["NOPE"]}})
+
+        self.assertEqual(base, {"awards": [{"id": "A", "field": 1}]})
+
+    def test_delete_missing_id_error_option(self):
+
+        schema = {
+            "properties": {
+                "awards": {
+                    "mergeStrategy": "arrayMergeByIdWithDelete",
+                    "mergeOptions": {"errorOnMissingDelete": True},
+                }
+            }
+        }
+
+        merger = jsonmerge.Merger(schema)
+
+        base = {"awards": [{"id": "A", "field": 1}]}
+
+        with self.assertRaises(HeadInstanceError) as cm:
+            merger.merge(base, {"awards": {"deletes": ["NOPE"]}})
+
+        self.assertEqual(cm.exception.value.ref, "#/awards/deletes/0")
+
+    def test_id_comparison_json_type_semantics(self):
+
+        schema = {
+            "mergeStrategy": "arrayMergeByIdWithDelete",
+            "mergeOptions": {"idRef": "/"},
+        }
+
+        merger = jsonmerge.Merger(schema)
+
+        # true and 1 are different IDs in JSON, so deleting 1 leaves true.
+        base = merger.merge([1, True], {
+            "items": [2],
+            "deletes": [1],
+        })
+        self.assertEqual(base, [True, 2])
+
+        # Deleting true leaves 1.
+        base = merger.merge([1, True], {
+            "deletes": [True],
+        })
+        self.assertEqual(base, [1])
+
+        # false and 0 do not match either.
+        base = merger.merge([0, False], {"deletes": [0]})
+        self.assertEqual(base, [False])
+
+    def test_non_unique_head_items_rejected(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(None, {"awards": {"items": [
+                {"id": "A", "field": 1},
+                {"id": "A", "field": 2},
+            ]}})
+
+    def test_non_unique_base_rejected(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        base = {"awards": [
+            {"id": "A", "field": 1},
+            {"id": "A", "field": 2},
+        ]}
+
+        with self.assertRaises(BaseInstanceError):
+            merger.merge(base, {"awards": {"deletes": ["A"]}})
+
+    def test_head_not_object(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(None, {"awards": [{"id": "A"}]})
+
+    def test_section_not_array(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(None, {"awards": {"deletes": "A"}})
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(None, {"awards": {"items": {"id": "A"}}})
+
+    def test_base_not_array(self):
+
+        merger = jsonmerge.Merger(self.schema)
+
+        with self.assertRaises(BaseInstanceError):
+            merger.merge({"awards": {"junk": 1}}, {"awards": {"deletes": []}})
+
+    def test_custom_section_refs(self):
+
+        schema = {
+            "mergeStrategy": "arrayMergeByIdWithDelete",
+            "mergeOptions": {
+                "itemsRef": "/changes",
+                "deletesRef": "/tombstones",
+            },
+        }
+
+        merger = jsonmerge.Merger(schema)
+
+        base = [{"id": "A"}, {"id": "B"}]
+        base = merger.merge(base, {
+            "changes": [{"id": "B", "v": 2}, {"id": "C"}],
+            "tombstones": ["A"],
+        })
+
+        self.assertEqual(base, [{"id": "B", "v": 2}, {"id": "C"}])
+
+    def test_nested_version_delete_removes_history_update_keeps_it(self):
+
+        schema = {
+            "properties": {
+                "awards": {
+                    "mergeStrategy": "arrayMergeByIdWithDelete",
+                    "items": {
+                        "properties": {
+                            "id": {"type": "string"},
+                            "field": {"mergeStrategy": "version"},
+                        }
+                    }
+                }
+            }
+        }
+
+        merger = jsonmerge.Merger(schema)
+
+        base = None
+        base = merger.merge(base, {"awards": {"items": [
+            {"id": "A", "field": 1},
+            {"id": "B", "field": 2},
+        ]}})
+        base = merger.merge(base, {"awards": {"items": [
+            {"id": "A", "field": 10},
+            {"id": "B", "field": 20},
+        ]}})
+
+        # Updates preserve each element's own version history.
+        self.assertEqual(base["awards"], [
+            {"id": "A", "field": [{"value": 1}, {"value": 10}]},
+            {"id": "B", "field": [{"value": 2}, {"value": 20}]},
+        ])
+
+        # Deleting A removes the element together with its whole history.
+        base = merger.merge(base, {"awards": {"deletes": ["A"]}})
+
+        self.assertEqual(base["awards"], [
+            {"id": "B", "field": [{"value": 2}, {"value": 20}]},
+        ])
+
+        # Re-creating A later starts a fresh history; nothing is resurrected.
+        base = merger.merge(base, {"awards": {"items": [
+            {"id": "A", "field": 99}]}})
+
+        a = [item for item in base["awards"] if item["id"] == "A"][0]
+        self.assertEqual(a["field"], [{"value": 99}])
+
+
 class TestGetSchema(unittest.TestCase):
 
     def test_default_overwrite(self):
@@ -1713,6 +2012,47 @@ class TestGetSchema(unittest.TestCase):
         schema2 = merger.get_schema()
 
         self.assertEqual(schema2, {'type': 'array'})
+
+    def test_merge_by_id_with_delete(self):
+        schema = {
+            'type': 'array',
+            'mergeStrategy': 'arrayMergeByIdWithDelete',
+            'mergeOptions': {
+                'itemsRef': '/items',
+                'deletesRef': '/deletes',
+            },
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'id': {'type': 'string'},
+                    'field': {'mergeStrategy': 'version'},
+                }
+            }
+        }
+
+        merger = jsonmerge.Merger(schema)
+        schema2 = merger.get_schema()
+
+        # The merged document is a plain business array. The head envelope
+        # with its separate items/deletes instruction arrays is not part of
+        # the result and must not appear in its schema.
+        self.assertEqual(schema2,
+                         {
+                             'type': 'array',
+                             'items': {
+                                 'type': 'object',
+                                 'properties': {
+                                     'id': {'type': 'string'},
+                                     'field': {
+                                         'type': 'array',
+                                         'items': {
+                                             'properties': {'value': {}}
+                                         }
+                                     }
+                                 }
+                             }
+                         })
+        self.assertNotIn('properties', schema2)
 
     def test_version(self):
         schema = {'mergeStrategy': 'version'}

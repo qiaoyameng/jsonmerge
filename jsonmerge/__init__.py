@@ -230,6 +230,7 @@ class Merger(object):
         "objectMerge": strategies.ObjectMerge(),
         "arrayMergeById": strategies.ArrayMergeById(),
         "arrayMergeByIndex": strategies.ArrayMergeByIndex(),
+        "arrayMergeByIdWithDelete": strategies.ArrayMergeByIdWithDelete(),
     }
 
     def __init__(self, schema, strategies=(), objclass_def='dict', objclass_menu=None,

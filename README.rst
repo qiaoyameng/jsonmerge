@@ -274,6 +274,45 @@ arrayMergeByIndex
   arrays will be merged based on the strategy specified further down in the
   hierarchy.
 
+arrayMergeByIdWithDelete
+  Like *arrayMergeById*, but the *head* instance is an object that carries
+  updated/new business items and explicit delete directives in two separate
+  arrays. The merged document is still a plain array of business objects; the
+  instruction structure is never merged into the result.
+
+  By default the head object is expected to contain an *items* array with the
+  business objects and a *deletes* array with the IDs of items to remove::
+
+      {
+          "items": [ {"id": "B", "field": 3}, {"id": "C", "field": 4} ],
+          "deletes": ["A"]
+      }
+
+  Only the IDs listed in the *deletes* array act as tombstones. A null entry
+  in *items*, or a business field that happens to be named "deletes", is
+  treated as ordinary business data and never deletes anything. Either array
+  may be omitted; an omitted *items* array applies deletes only and vice
+  versa.
+
+  If the same ID appears both as an update and as a delete directive in one
+  head, a *HeadInstanceError* is raised. By default, deleting an ID that is
+  not present in *base* is silently ignored. Set the *errorOnMissingDelete*
+  merge option to true to raise a *HeadInstanceError* in that case instead.
+
+  As with *arrayMergeById*, surviving items keep their relative order from
+  *base*, updated items stay in place and new items are appended in head
+  order. Matching items are merged with the subschema strategy, so a nested
+  *version* strategy keeps each element's own history for updates, while a
+  delete removes the element together with its whole version history.
+
+  The locations of the two instruction arrays can be changed with the
+  *itemsRef* and *deletesRef* JSON pointer merge options (both resolved
+  relative to the head object). The *idRef*, *ignoreId*, *sortByRef* and
+  *sortReverse* options work the same way as in *arrayMergeById*.
+
+  ID comparison follows JSON type semantics: for example, *true* and *1*
+  (or *false* and *0*) are different IDs.
+
 objectMerge
   Merge objects. Resulting objects have properties from both *base* and
   *head*. Any properties that are present both in *base* and *head* are

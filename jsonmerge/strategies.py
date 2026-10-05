@@ -6,6 +6,29 @@ from jsonmerge.jsonvalue import JSONValue
 import jsonschema
 import re
 
+def json_equal(a, b):
+    """Compare two values using JSON type semantics.
+
+    Unlike Python's ``==``, JSON's ``true`` and ``false`` are never equal to
+    the numbers ``1`` and ``0`` (booleans are a type of their own in JSON).
+    Objects and arrays are compared recursively.
+    """
+
+    # bool is a subclass of int in Python, so check it first.
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and \
+               all(json_equal(x, y) for x, y in zip(a, b))
+
+    if isinstance(a, dict) and isinstance(b, dict):
+        if set(a.keys()) != set(b.keys()):
+            return False
+        return all(json_equal(a[k], b[k]) for k in a)
+
+    return a == b
+
 class Strategy(object):
     """Base class for merge strategies.
     """
@@ -272,6 +295,173 @@ class ArrayMergeByIndex(ArrayMergeById):
     def iter_index_key_item(self, walk, jv, idRef):
         for i, item in enumerate(jv):
             yield i, i, item
+
+class ArrayMergeByIdWithDelete(ArrayMergeById):
+    """Merge by ID, with explicit delete directives carried alongside the
+    business objects.
+
+    The *head* instance is an object that keeps updated/new business items and
+    delete instructions in two separate arrays. The merge result is always a
+    plain array of business items - the instruction structure never leaks into
+    the result. Tombstones are only the IDs listed in the delete array: a null
+    item or a business field that happens to use the same name as the delete
+    array is never interpreted as a tombstone.
+
+    Options (in addition to those of arrayMergeById):
+
+    itemsRef -- JSON pointer (relative to the head object) to the array with
+                updated/new business items. Defaults to "items".
+    deletesRef -- JSON pointer (relative to the head object) to the array of
+                IDs to delete. Defaults to "deletes".
+    errorOnMissingDelete -- If true, deleting an ID that is not present in
+                base raises a HeadInstanceError. If false (default) such
+                directives are ignored.
+    """
+
+    def _section(self, walk, head, ref, name):
+        if head.is_undef():
+            return JSONValue([], head.ref)
+
+        section_ref = head.ref
+        for part in ref.lstrip("/").split("/"):
+            section_ref += "/" + part.replace('~', '~0').replace('/', '~1')
+
+        try:
+            section = JSONValue(self._resolve_ref(walk, head, ref), section_ref)
+        except jsonschema.RefResolutionError:
+            # A batch may carry only updates or only deletes; a missing
+            # section means there is nothing of that kind to apply.
+            return JSONValue([], section_ref)
+
+        if section.is_undef() or section.val is None:
+            return JSONValue([], section.ref)
+
+        if not walk.is_type(section, "array"):
+            raise HeadInstanceError(
+                    "Head '%s' at '%s' is not an array" % (name, ref), section)
+
+        return section
+
+    def merge(self, walk, base, head, schema,
+              idRef="id", ignoreId=None, itemsRef="items", deletesRef="deletes",
+              errorOnMissingDelete=False,
+              sortByRef=None, sortReverse=None, **kwargs):
+
+        if not base.is_undef() and not walk.is_type(base, "array"):
+            raise BaseInstanceError("Base is not an array", base)
+
+        if not head.is_undef() and not walk.is_type(head, "object"):
+            raise HeadInstanceError(
+                    "Head is not an object with separate items and delete "
+                    "directive arrays", head)
+
+        head_items = self._section(walk, head, itemsRef, "items")
+        head_deletes = self._section(walk, head, deletesRef, "deletes")
+
+        return self._merge(walk, base, head_items, head_deletes, schema,
+                           idRef=idRef, ignoreId=ignoreId,
+                           errorOnMissingDelete=errorOnMissingDelete,
+                           sortByRef=sortByRef, sortReverse=sortReverse)
+
+    def _merge(self, walk, base, head, head_deletes, schema, idRef, ignoreId,
+               errorOnMissingDelete, sortByRef, sortReverse):
+
+        subschema = schema.get('items')
+
+        if walk.is_type(subschema, "array"):
+            raise SchemaError("This strategy is not supported when 'items' is an array", subschema)
+
+        if base.is_undef():
+            base = JSONValue([], schema.ref)
+        else:
+            base = JSONValue(list(base.val), base.ref)
+
+        # Updated/new business items must not repeat an ID.
+        head_updates = list(self.iter_index_key_item(walk, head, idRef))
+        for i, key_1, item_1 in head_updates:
+            for j, key_2, item_2 in head_updates:
+                if j < i:
+                    if json_equal(key_1, key_2):
+                        raise HeadInstanceError(
+                                "Id '%s' was not unique in head" % (key_1,), item_1)
+                else:
+                    break
+
+        # Repeated delete directives for one ID are treated as a single
+        # directive. An ID may not be both updated and deleted in the same
+        # batch.
+        delete_directives = []
+        for delete_item in head_deletes:
+            # Any JSON value (including null) is a valid delete directive.
+            delete_key = delete_item.val
+            if any(json_equal(delete_key, seen_key)
+                   for seen_key, _ in delete_directives):
+                continue
+            delete_directives.append((delete_key, delete_item))
+
+            for _, update_key, update_item in head_updates:
+                if json_equal(delete_key, update_key):
+                    raise HeadInstanceError(
+                            "Id '%s' is both updated and deleted in head"
+                            % (delete_key,), delete_item)
+
+        # Apply updates/inserts. Surviving items keep their position; new
+        # items are appended in head order.
+        for i, head_key, head_item in head_updates:
+
+            if json_equal(head_key, ignoreId):
+                continue
+
+            matching_j = []
+            for j, base_key, base_item in self.iter_index_key_item(walk, base, idRef):
+                if json_equal(base_key, head_key):
+                    matching_j.append(j)
+                    matched_item = base_item
+
+            if len(matching_j) == 1:
+                # Replace in place with the recursively merged item so that
+                # nested strategies (e.g. version) retain the element's
+                # history.
+                j = matching_j[0]
+                base[j] = walk.descend(subschema, matched_item, head_item)
+            elif len(matching_j) == 0:
+                base.append(walk.descend(subschema, JSONValue(undef=True), head_item))
+            else:
+                j = matching_j[1]
+                raise BaseInstanceError(
+                        "Id '%s' was not unique in base" % (head_key,), base[j])
+
+        # Apply deletes. Removing from the highest index first keeps the other
+        # indices valid.
+        for delete_key, delete_item in reversed(delete_directives):
+
+            matching_j = []
+            for j, base_key, base_item in self.iter_index_key_item(walk, base, idRef):
+                if json_equal(base_key, delete_key):
+                    matching_j.append(j)
+
+            if len(matching_j) > 1:
+                raise BaseInstanceError(
+                        "Id '%s' was not unique in base" % (delete_key,),
+                        base[matching_j[1]])
+            elif len(matching_j) == 0:
+                if errorOnMissingDelete:
+                    raise HeadInstanceError(
+                            "Id '%s' to delete was not found in base"
+                            % (delete_key,), delete_item)
+            else:
+                del base.val[matching_j[0]]
+
+        self.sort_array(walk, base, sortByRef, sortReverse)
+
+        return base
+
+    def get_schema(self, walk, schema, **kwargs):
+        subschema = schema.get('items')
+        if not subschema.is_undef():
+            schema['items'] = walk.descend(subschema)
+
+        return schema
 
 
 class ObjectMerge(Strategy):
