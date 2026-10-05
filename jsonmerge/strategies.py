@@ -206,6 +206,19 @@ class Append(ArrayStrategy):
 
 class ArrayMergeById(ArrayStrategy):
 
+    BRANCH_OPTIONS = (
+            'branches',
+            'mapping',
+    )
+
+    TYPE_CHANGE_OPTIONS = (
+            'onTypeChange',
+    )
+
+    DISCRIMINATOR_OPTIONS = (
+            'discriminatorRef',
+    )
+
     def get_key(self, walk, item, idRef):
         return self._resolve_ref(walk, item, idRef)
 
@@ -218,11 +231,212 @@ class ArrayMergeById(ArrayStrategy):
 
             yield i, key, item
 
+    def _merge_option(self, schema, kwargs, *names):
+        options = schema.get('mergeOptions')
+
+        if not options.is_undef():
+            for name in names:
+                if name in options.val:
+                    return options.get(name)
+
+        for name in names:
+            if name in kwargs:
+                return JSONValue(kwargs[name],
+                        schema.ref + '/mergeOptions/' + name)
+
+        return JSONValue(undef=True)
+
+    def _resolve_schema(self, walk, schema):
+        if schema.is_undef() or not walk.is_type(schema, 'object'):
+            return schema
+
+        ref = schema.val.get('$ref')
+        if ref is None:
+            return schema
+
+        try:
+            with walk.resolver.resolving(ref) as resolved:
+                if not isinstance(resolved, dict):
+                    raise SchemaError("'$ref' does not point to an object",
+                            schema)
+                return JSONValue(resolved, ref)
+        except jsonschema.RefResolutionError:
+            return JSONValue(undef=True)
+
+    def _discriminator_pointer(self, ref):
+        if ref.startswith('/'):
+            return ref
+        else:
+            return '/' + ref
+
+    def _mapping_branches(self, walk, mapping):
+        branches = []
+        for value, branch in mapping.items():
+            if not walk.is_type(branch, 'string') and \
+                    not walk.is_type(branch, 'object'):
+                raise SchemaError("Discriminator branch is not a schema",
+                        branch)
+            branches.append((value, branch))
+        return branches
+
+    def _discriminator_config(self, walk, schema, subschema, kwargs):
+        discriminator_ref = self._merge_option(schema, kwargs,
+                *self.DISCRIMINATOR_OPTIONS)
+        branch_option = self._merge_option(schema, kwargs,
+                *self.BRANCH_OPTIONS)
+        type_change = self._merge_option(schema, kwargs,
+                *self.TYPE_CHANGE_OPTIONS)
+
+        if type_change.is_undef():
+            type_change = JSONValue('replace', schema.ref)
+        elif not walk.is_type(type_change, 'string') or \
+                type_change.val not in ('replace', 'reject'):
+            raise SchemaError(
+                    "Type change behavior must be 'replace' or 'reject'",
+                    type_change)
+
+        item_schema = self._resolve_schema(walk, subschema)
+
+        mapping = branch_option
+        item_discriminator = JSONValue(undef=True)
+        option_discriminator = self._merge_option(schema, kwargs,
+                'discriminator')
+
+        if not item_schema.is_undef() and walk.is_type(item_schema, 'object'):
+            item_discriminator = item_schema.get('discriminator')
+
+        if not item_discriminator.is_undef():
+            if not walk.is_type(item_discriminator, 'object'):
+                raise SchemaError("Discriminator is not an object",
+                        item_discriminator)
+
+            discriminator_ref = item_discriminator.get('propertyName')
+            mapping = item_discriminator.get('mapping')
+        elif walk.is_type(option_discriminator, 'object'):
+            discriminator_ref = option_discriminator.get('propertyName')
+            mapping = option_discriminator.get('mapping')
+        elif walk.is_type(option_discriminator, 'string'):
+            discriminator_ref = option_discriminator
+
+        if discriminator_ref.is_undef():
+            return None
+
+        if not walk.is_type(discriminator_ref, 'string') or \
+                not discriminator_ref.val:
+            raise SchemaError("Discriminator property name is not a string",
+                    discriminator_ref)
+
+        branches = None
+
+        if mapping.is_undef() and not item_schema.is_undef() and \
+                walk.is_type(item_schema, 'object'):
+            one_of = item_schema.get('oneOf')
+            if not one_of.is_undef():
+                if not walk.is_type(one_of, 'array'):
+                    raise SchemaError("'oneOf' is not an array", one_of)
+
+                mapping = JSONValue({}, item_schema.ref + '/oneOf')
+                branches = []
+                for branch in one_of:
+                    try:
+                        property_schema = branch.val['properties'][
+                                discriminator_ref.val]
+                        enum = property_schema['enum']
+                        value = enum[0]
+                    except (KeyError, IndexError, TypeError):
+                        raise SchemaError(
+                                "Branch schema is not registered with an "
+                                "enum discriminator value", branch)
+                    mapping.val[value] = branch.val
+                    branches.append((value, branch))
+
+        if mapping.is_undef():
+            raise SchemaError("No discriminator branch schemas are registered",
+                    item_schema)
+
+        if not walk.is_type(mapping, 'object'):
+            raise SchemaError("Discriminator branch mapping is not an object",
+                    mapping)
+
+        if branches is None:
+            branches = self._mapping_branches(walk, mapping)
+
+        return {
+                'branch_order': [value for value, branch in branches],
+                'ref': discriminator_ref.val,
+                'branches': dict((value, branch)
+                        for value, branch in branches),
+                'onTypeChange': type_change.val,
+        }
+
+    def _discriminator_value(self, walk, item, config, head):
+        error_class = HeadInstanceError if head else BaseInstanceError
+
+        try:
+            value = self._resolve_ref(walk, item,
+                    self._discriminator_pointer(config['ref']))
+        except (jsonschema.RefResolutionError, KeyError, TypeError,
+                IndexError, AttributeError):
+            value = None
+
+        if value is None:
+            raise error_class(
+                    "Discriminator field '%s' has no value" %
+                    (config['ref'],), item)
+
+        return value
+
+    def _resolve_branch(self, walk, value, raw_branch, item):
+        if walk.is_type(raw_branch, 'string'):
+            ref = raw_branch.val
+            branch = JSONValue({'$ref': ref}, raw_branch.ref)
+        else:
+            branch = raw_branch
+            ref = branch.val.get('$ref')
+
+        if ref is not None:
+            try:
+                with walk.resolver.resolving(ref) as resolved:
+                    if not isinstance(resolved, dict):
+                        raise SchemaError(
+                                "Discriminator branch '%s' does not point "
+                                "to an object schema" % (value,), item)
+                    branch = JSONValue(resolved, ref)
+            except jsonschema.RefResolutionError:
+                raise SchemaError(
+                        "Unable to resolve schema for discriminator branch "
+                        "'%s'" % (value,), item)
+
+        return branch
+
+    def _select_branch(self, walk, item, config, head):
+        value = self._discriminator_value(walk, item, config, head)
+        raw_branch = config['branches'].get(value)
+
+        if raw_branch is None:
+            error_class = HeadInstanceError if head else BaseInstanceError
+            raise error_class("Unknown discriminator value '%s'" % (value,),
+                    item)
+
+        return value, self._resolve_branch(walk, value, raw_branch, item)
+
     def _merge(self, walk, base, head, schema, idRef="id", ignoreId=None, sortByRef=None, sortReverse=None, **kwargs):
         subschema = schema.get('items')
 
         if walk.is_type(subschema, "array"):
             raise SchemaError("This strategy is not supported when 'items' is an array", subschema)
+
+        discriminator = self._discriminator_config(walk, schema, subschema,
+                kwargs)
+
+        head_branches = {}
+        if discriminator is not None:
+            for i, head_key, head_item in self.iter_index_key_item(
+                    walk, head, idRef):
+                if head_key == ignoreId:
+                    continue
+                head_branches[i] = self._select_branch(walk, head_item,
+                        discriminator, True)
 
         for i, key_1, item_1 in self.iter_index_key_item(walk, head, idRef):
             for j, key_2, item_2 in self.iter_index_key_item(walk, head, idRef):
@@ -237,6 +451,12 @@ class ArrayMergeById(ArrayStrategy):
             if head_key == ignoreId:
                 continue
 
+            if discriminator is not None:
+                head_value, head_branch = head_branches[i]
+            else:
+                head_value = None
+                head_branch = subschema
+
             matching_j = []
             for j, base_key, base_item in self.iter_index_key_item(walk, base, idRef):
 
@@ -247,10 +467,29 @@ class ArrayMergeById(ArrayStrategy):
             if len(matching_j) == 1:
                 # If there was exactly one match, we replace it with a merged item
                 j = matching_j[0]
-                base[j] = walk.descend(subschema, matched_item, head_item)
+                if discriminator is None:
+                    merged_item = walk.descend(subschema, matched_item,
+                            head_item)
+                else:
+                    base_value, base_branch = self._select_branch(walk,
+                            matched_item, discriminator, False)
+
+                    if base_value == head_value:
+                        merged_item = walk.descend(head_branch, matched_item,
+                                head_item)
+                    elif discriminator['onTypeChange'] == 'replace':
+                        merged_item = head_item
+                    else:
+                        raise HeadInstanceError(
+                                "Base and head discriminator values differ: "
+                                "'%s' != '%s'" %
+                                (base_value, head_value), head_item)
+
+                base[j] = merged_item
             elif len(matching_j) == 0:
                 # If there wasn't a match, we append a new object
-                base.append(walk.descend(subschema, JSONValue(undef=True), head_item))
+                base.append(walk.descend(head_branch, JSONValue(
+                        undef=True, ref=head_item.ref), head_item))
             else:
                 j = matching_j[1]
                 raise BaseInstanceError("Id '%s' was not unique in base" % (base_key,), base[j])
@@ -261,8 +500,58 @@ class ArrayMergeById(ArrayStrategy):
 
     def get_schema(self, walk, schema, **kwargs):
         subschema = schema.get('items')
-        if not subschema.is_undef():
-            schema['items'] = walk.descend(subschema)
+        discriminator = self._discriminator_config(walk, schema,
+                subschema, kwargs)
+
+        if discriminator is None:
+            if not subschema.is_undef():
+                schema['items'] = walk.descend(subschema)
+        else:
+            branches = []
+            resolved_refs = set()
+            for value in discriminator['branch_order']:
+                raw_branch = discriminator['branches'][value]
+                branch_ref = None
+                if walk.is_type(raw_branch, 'string'):
+                    ref = raw_branch.val
+                    branch_schema = JSONValue({'$ref': ref},
+                            raw_branch.ref)
+                else:
+                    branch_schema = raw_branch
+                    if walk.is_type(branch_schema, 'object'):
+                        ref = branch_schema.val.get('$ref')
+                    else:
+                        ref = None
+
+                if ref is not None and not walk.resolver.is_remote_ref(ref):
+                    branch_ref = ref
+                    if ref not in resolved_refs:
+                        try:
+                            with walk.resolver.resolving(ref) as resolved:
+                                walk.descend(JSONValue(resolved, ref))
+                        except jsonschema.RefResolutionError:
+                            raise SchemaError(
+                                    "Unable to resolve schema for "
+                                    "discriminator branch '%s'" %
+                                    (value,), schema.get('items'))
+                        resolved_refs.add(ref)
+
+                if branch_ref is not None:
+                    branches.append({'$ref': branch_ref})
+                elif walk.is_type(branch_schema, 'string'):
+                    branches.append(walk.descend(branch_schema).val)
+                else:
+                    branches.append(walk.descend(branch_schema).val)
+
+            if walk.is_type(subschema, 'object'):
+                item_schema = JSONValue(dict(subschema.val),
+                        subschema.ref)
+                item_schema.val.pop('discriminator', None)
+            else:
+                item_schema = JSONValue({}, schema.ref + '/items')
+
+            item_schema.val['oneOf'] = branches
+            schema['items'] = item_schema
 
         return schema
 

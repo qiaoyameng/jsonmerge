@@ -267,6 +267,24 @@ arrayMergeById
   *JSON pointer*. The pointer is resolved in the same way as *idRef*. Sort
   order can be reversed by setting the *sortReverse* option.
 
+  Array items can use an explicit discriminator field to select their merge
+  schema. Put a *discriminator* object on *items* with *propertyName* and a
+  *mapping* from discriminator values to schema references. Alternatively,
+  use the *discriminatorRef* and *branches* merge options. Branch schemas are
+  selected directly from the discriminator value; *jsonmerge* does not try
+  each *oneOf* branch in turn.
+
+  When two items with the same ID have the same discriminator value, their
+  selected branch schemas are used to merge the items recursively. If the
+  discriminator value changes, *onTypeChange* defaults to *replace*, which
+  replaces the complete item. Set it to *reject* to raise an error instead.
+  Missing discriminator values, unregistered values and broken branch schema
+  references are reported with the path of the offending array item.
+
+  The schema returned by *get_schema()* contains every registered result
+  branch in *oneOf*. Merge strategies inside those branches, including
+  *version*, are transformed in the usual way.
+
 arrayMergeByIndex
   Merge array items by their index in the array. Similarly to
   *arrayMergeById* strategy, the resulting arrays have items from both

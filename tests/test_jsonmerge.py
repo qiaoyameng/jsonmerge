@@ -2,6 +2,7 @@
 import unittest
 import warnings
 import sys
+import copy
 
 from collections import OrderedDict
 import jsonmerge
@@ -1130,6 +1131,197 @@ class TestMerge(unittest.TestCase):
         base = merger.merge(base, b)
 
         self.assertEqual(base, expected)
+
+    def test_merge_by_id_discriminator_nested(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "groups": {
+                    "type": "array",
+                    "mergeStrategy": "arrayMergeById",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "entries": {
+                                "type": "array",
+                                "mergeStrategy": "arrayMergeById",
+                                "items": {
+                                    "discriminator": {
+                                        "propertyName": "kind"
+                                    },
+                                    "oneOf": [
+                                        {
+                                            "properties": {
+                                                "id": {"type": "string"},
+                                                "kind": {"enum": ["text"]},
+                                                "text": {"type": "string"},
+                                                "history": {
+                                                    "mergeStrategy": "version"
+                                                },
+                                            }
+                                        },
+                                        {
+                                            "properties": {
+                                                "id": {"type": "string"},
+                                                "kind": {"enum": ["image"]},
+                                                "url": {"type": "string"},
+                                            }
+                                        },
+                                        {
+                                            "properties": {
+                                                "id": {"type": "string"},
+                                                "kind": {"enum": ["link"]},
+                                                "href": {"type": "string"},
+                                            }
+                                        },
+                                    ],
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }
+
+        original_schema = copy.deepcopy(schema)
+        merger = jsonmerge.Merger(schema)
+
+        rev1 = {
+            "groups": [
+                {
+                    "id": "group-1",
+                    "entries": [
+                        {"id": "a", "kind": "text", "text": "old",
+                                "history": 1},
+                        {"id": "b", "kind": "image", "url": "old.png"},
+                    ],
+                }
+            ]
+        }
+
+        rev2 = {
+            "groups": [
+                {
+                    "id": "group-1",
+                    "entries": [
+                        {"id": "a", "kind": "text", "text": "new",
+                                "history": 2},
+                        {"id": "b", "kind": "link", "href": "new.html"},
+                        {"id": "c", "kind": "image", "url": "new.png"},
+                    ],
+                }
+            ]
+        }
+
+        result = merger.merge(None, rev1)
+        result = merger.merge(result, rev2)
+        self.assertEqual(schema, original_schema)
+
+        expected = {
+            "groups": [
+                {
+                    "id": "group-1",
+                    "entries": [
+                        {"id": "a", "kind": "text", "text": "new",
+                                "history": [
+                                    {"value": 1},
+                                    {"value": 2},
+                                ]},
+                        {"id": "b", "kind": "link",
+                                "href": "new.html"},
+                        {"id": "c", "kind": "image", "url": "new.png"},
+                    ],
+                }
+            ]
+        }
+
+        self.assertEqual(result, expected)
+
+        output_schema = merger.get_schema()
+        jsonschema.Draft4Validator(output_schema).validate(result)
+
+    def test_merge_by_id_discriminator_errors(self):
+        schema = {
+            "properties": {
+                "groups": {
+                    "type": "array",
+                    "mergeStrategy": "arrayMergeById",
+                    "items": {
+                        "properties": {
+                            "entries": {
+                                "type": "array",
+                                "mergeStrategy": "arrayMergeById",
+                                "items": {
+                                    "discriminator": {
+                                        "propertyName": "kind",
+                                        "mapping": {
+                                            "text": {"properties": {
+                                                "text": {"type": "string"}}},
+                                            "image": "#/definitions/missing",
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }
+
+        def document(item):
+            return {"groups": [{"id": "group-1", "entries": [item]}]}
+
+        merger = jsonmerge.Merger(schema)
+
+        with self.assertRaises(HeadInstanceError) as cm:
+            merger.merge(None, document({"id": "a"}))
+        self.assertEqual(cm.exception.value.ref,
+                "#/groups/0/entries/0")
+
+        with self.assertRaises(HeadInstanceError) as cm:
+            merger.merge(None,
+                    document({"id": "b", "text": "has no kind"}))
+        self.assertEqual(cm.exception.value.ref,
+                "#/groups/0/entries/0")
+
+        with self.assertRaises(HeadInstanceError) as cm:
+            merger.merge(None,
+                    document({"id": "a", "kind": "unknown"}))
+        self.assertEqual(cm.exception.value.ref,
+                "#/groups/0/entries/0")
+
+        with self.assertRaises(SchemaError) as cm:
+            merger.merge(document({"id": "a", "kind": "image"}),
+                    document({"id": "a", "kind": "image",
+                            "url": "new.png"}))
+        self.assertEqual(cm.exception.value.ref,
+                "#/groups/0/entries/0")
+
+    def test_merge_by_id_discriminator_reject_type_change(self):
+        schema = {
+            "type": "array",
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": {"onTypeChange": "reject"},
+            "items": {
+                "discriminator": {"propertyName": "kind"},
+                "oneOf": [
+                    {"properties": {"id": {}, "kind": {"enum": ["text"]},
+                            "text": {}}},
+                    {"properties": {"id": {}, "kind": {"enum": ["image"]},
+                            "url": {}}},
+                ],
+            },
+        }
+
+        merger = jsonmerge.Merger(schema)
+
+        with self.assertRaises(HeadInstanceError) as cm:
+            merger.merge(
+                    [{"id": "a", "kind": "text", "text": "old"}],
+                    [{"id": "a", "kind": "image", "url": "new.png"}])
+
+        self.assertEqual(cm.exception.value.ref, "#/0")
 
     def test_merge_by_id_items_array(self):
         schema = {
@@ -2389,6 +2581,142 @@ class TestGetSchema(unittest.TestCase):
         schema2 = merger.get_schema()
 
         self.assertEqual(schema2, expected)
+
+    def test_merge_by_id_discriminator_schema(self):
+        schema = {
+            "mergeStrategy": "arrayMergeById",
+            "items": {
+                "discriminator": {"propertyName": "kind"},
+                "oneOf": [
+                    {
+                        "properties": {
+                            "id": {},
+                            "kind": {"enum": ["text"]},
+                            "text": {},
+                            "history": {"mergeStrategy": "version"},
+                        }
+                    },
+                    {
+                        "properties": {
+                            "id": {},
+                            "kind": {"enum": ["image"]},
+                            "url": {},
+                        }
+                    },
+                    {
+                        "properties": {
+                            "id": {},
+                            "kind": {"enum": ["link"]},
+                            "href": {},
+                        }
+                    },
+                ],
+            },
+        }
+
+        expected = {
+            "items": {
+                "oneOf": [
+                    {
+                        "properties": {
+                            "id": {},
+                            "kind": {"enum": ["text"]},
+                            "text": {},
+                            "history": {
+                                "type": "array",
+                                "items": {
+                                    "properties": {
+                                        "value": {},
+                                    }
+                                },
+                            },
+                        }
+                    },
+                    {
+                        "properties": {
+                            "id": {},
+                            "kind": {"enum": ["image"]},
+                            "url": {},
+                        }
+                    },
+                    {
+                        "properties": {
+                            "id": {},
+                            "kind": {"enum": ["link"]},
+                            "href": {},
+                        }
+                    },
+                ],
+            },
+        }
+
+        merger = jsonmerge.Merger(schema)
+        self.assertEqual(merger.get_schema(), expected)
+
+    def test_merge_by_id_discriminator_ref_schema(self):
+        schema = {
+            "definitions": {
+                "image": {
+                    "properties": {
+                        "id": {},
+                        "kind": {"enum": ["image"]},
+                        "url": {},
+                    }
+                },
+                "text": {
+                    "properties": {
+                        "id": {},
+                        "kind": {"enum": ["text"]},
+                        "history": {"mergeStrategy": "version"},
+                    }
+                },
+            },
+            "mergeStrategy": "arrayMergeById",
+            "items": {
+                "discriminator": {
+                    "propertyName": "kind",
+                    "mapping": {
+                        "image": "#/definitions/image",
+                        "text": "#/definitions/text",
+                    },
+                },
+            },
+        }
+
+        expected = {
+            "definitions": {
+                "image": {
+                    "properties": {
+                        "id": {},
+                        "kind": {"enum": ["image"]},
+                        "url": {},
+                    }
+                },
+                "text": {
+                    "properties": {
+                        "id": {},
+                        "kind": {"enum": ["text"]},
+                        "history": {
+                            "type": "array",
+                            "items": {
+                                "properties": {
+                                    "value": {},
+                                }
+                            },
+                        },
+                    }
+                },
+            },
+            "items": {
+                "oneOf": [
+                    {"$ref": "#/definitions/image"},
+                    {"$ref": "#/definitions/text"},
+                ],
+            },
+        }
+
+        merger = jsonmerge.Merger(schema)
+        self.assertEqual(merger.get_schema(), expected)
 
     def test_merge_by_id_with_sort(self):
         schema = {
