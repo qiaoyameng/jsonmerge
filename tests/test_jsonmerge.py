@@ -9,7 +9,8 @@ import jsonmerge.strategies
 from jsonmerge.exceptions import (
     HeadInstanceError,
     BaseInstanceError,
-    SchemaError
+    SchemaError,
+    OrderingError
 )
 from jsonmerge.jsonvalue import JSONValue
 
@@ -1325,6 +1326,158 @@ class TestMerge(unittest.TestCase):
         merger = jsonmerge.Merger(schema)
         base = merger.merge(base, head)
         self.assertEqual(base, expected)
+
+    def _ordering_schema(self):
+        return {
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": {"idRef": "id"},
+            "items": {"mergeStrategy": "objectMerge"},
+        }
+
+    def test_merge_by_id_ordering_preserves_both_sides(self):
+        # base and head each insert different items around a shared anchor.
+        # Both local orders must be preserved in the merged output.
+        schema = self._ordering_schema()
+
+        base = [
+            {'id': 'b1'},
+            {'id': 'x', 'val': 'base'},
+            {'id': 'b2'},
+        ]
+
+        head = [
+            {'id': 'h1', 'val': 'h1'},
+            {'id': 'x', 'val': 'head'},
+            {'id': 'h2', 'val': 'h2'},
+        ]
+
+        ordering = {
+            'b1': {'before': ['x']},
+            'b2': {'after': ['x']},
+            'h1': {'before': ['x']},
+            'h2': {'after': ['x']},
+        }
+
+        merger = jsonmerge.Merger(schema)
+        result = merger.merge(base, head,
+                merge_options={"arrayMergeById": {"ordering": ordering}})
+
+        ids = [item['id'] for item in result]
+        position = dict((id_, i) for i, id_ in enumerate(ids))
+
+        self.assertEqual(set(ids), set(['b1', 'b2', 'h1', 'h2', 'x']))
+        self.assertTrue(position['b1'] < position['x'])
+        self.assertTrue(position['b2'] > position['x'])
+        self.assertTrue(position['h1'] < position['x'])
+        self.assertTrue(position['h2'] > position['x'])
+
+        # content of the shared item is still merged by ID
+        self.assertEqual(result[position['x']],
+                {'id': 'x', 'val': 'head'})
+
+    def test_merge_by_id_ordering_stable_fallback(self):
+        # Items not involved in any relation keep base-first-then-head order.
+        schema = self._ordering_schema()
+
+        base = [{'id': 'a'}, {'id': 'b'}]
+        head = [{'id': 'a', 'x': 1}, {'id': 'c'}, {'id': 'd'}]
+
+        ordering = {'d': {'before': ['b']}}
+
+        merger = jsonmerge.Merger(schema)
+        result = merger.merge(base, head,
+                merge_options={"arrayMergeById": {"ordering": ordering}})
+
+        ids = [item['id'] for item in result]
+
+        # base items keep their relative order; new head item 'c' is placed
+        # after unconstrained base items, 'd' is pulled before 'b'
+        self.assertTrue(ids.index('a') < ids.index('b'))
+        self.assertTrue(ids.index('d') < ids.index('b'))
+        self.assertEqual(result[ids.index('a')], {'id': 'a', 'x': 1})
+
+    def test_merge_by_id_ordering_empty_is_natural_order(self):
+        schema = self._ordering_schema()
+
+        base = [{'id': 'a'}, {'id': 'b'}]
+        head = [{'id': 'c'}, {'id': 'a'}]
+
+        merger = jsonmerge.Merger(schema)
+        result = merger.merge(base, head,
+                merge_options={"arrayMergeById": {"ordering": {}}})
+
+        self.assertEqual([item['id'] for item in result],
+                ['a', 'b', 'c'])
+
+    def test_merge_by_id_ordering_edge_list(self):
+        schema = self._ordering_schema()
+
+        base = [{'id': 'a'}, {'id': 'b'}, {'id': 'c'}]
+        head = [{'id': 'd'}]
+
+        ordering = [
+            {'id': 'd', 'before': ['a', 'b']},
+            {'id': 'c', 'after': ['b']},
+        ]
+
+        merger = jsonmerge.Merger(schema)
+        result = merger.merge(base, head,
+                merge_options={"arrayMergeById": {"ordering": ordering}})
+
+        ids = [item['id'] for item in result]
+
+        self.assertTrue(ids.index('d') < ids.index('a'))
+        self.assertTrue(ids.index('d') < ids.index('b'))
+        self.assertTrue(ids.index('b') < ids.index('c'))
+
+    def test_merge_by_id_ordering_unknown_id(self):
+        schema = self._ordering_schema()
+
+        base = [{'id': 'a'}, {'id': 'b'}, {'id': 'c'}]
+        head = []
+
+        ordering = {'a': {'before': ['b']}, 'b': {'before': ['zzz']}}
+
+        merger = jsonmerge.Merger(schema)
+        with self.assertRaises(OrderingError) as cm:
+            merger.merge(base, head,
+                    merge_options={"arrayMergeById": {"ordering": ordering}})
+
+        self.assertTrue('zzz' in str(cm.exception))
+        self.assertEqual(cm.exception.strategy_name, 'arrayMergeById')
+
+    def test_merge_by_id_ordering_cycle(self):
+        schema = self._ordering_schema()
+
+        base = [{'id': 'a'}, {'id': 'b'}, {'id': 'c'}]
+        head = []
+
+        ordering = {
+            'a': {'before': ['b']},
+            'b': {'before': ['c']},
+            'c': {'before': ['a']},
+        }
+
+        merger = jsonmerge.Merger(schema)
+        with self.assertRaises(OrderingError) as cm:
+            merger.merge(base, head,
+                    merge_options={"arrayMergeById": {"ordering": ordering}})
+
+        message = str(cm.exception)
+        self.assertTrue('cycle' in message)
+        # the reported cycle must be checkable edge by edge
+        self.assertTrue("'a' -> 'b' -> 'c' -> 'a'" in message)
+
+    def test_merge_by_id_ordering_invalid_shape(self):
+        schema = self._ordering_schema()
+
+        base = [{'id': 'a'}]
+        head = []
+
+        merger = jsonmerge.Merger(schema)
+        with self.assertRaises(SchemaError):
+            merger.merge(base, head,
+                    merge_options={"arrayMergeById": {"ordering": "bad"}})
 
     def test_merge_by_id_subclass_get_key(self):
 

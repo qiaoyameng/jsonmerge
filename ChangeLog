@@ -1,3 +1,9 @@
+2026-10-05	jsonmerge	1.10.0
+	* Add "ordering" merge option for the arrayMergeById strategy: items
+	  are reordered to satisfy explicitly declared before/after relations,
+	  with stable fallback (base first occurrence, then new head items).
+	  Unknown IDs and cycles raise OrderingError.
+
 2023-07-19	jsonmerge	1.9.2
 	* Fix failing tests with jsonschema>=4.18.0.
 

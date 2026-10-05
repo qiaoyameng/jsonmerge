@@ -1,10 +1,12 @@
 # vim:ts=4 sw=4 expandtab softtabstop=4
 from jsonmerge.exceptions import HeadInstanceError, \
                                  BaseInstanceError, \
-                                 SchemaError
+                                 SchemaError, \
+                                 OrderingError
 from jsonmerge.jsonvalue import JSONValue
 import jsonschema
 import re
+import heapq
 
 class Strategy(object):
     """Base class for merge strategies.
@@ -206,8 +208,174 @@ class Append(ArrayStrategy):
 
 class ArrayMergeById(ArrayStrategy):
 
+    _MISSING = object()
+
     def get_key(self, walk, item, idRef):
         return self._resolve_ref(walk, item, idRef)
+
+    def _format_id(self, key):
+        if isinstance(key, str):
+            return "'%s'" % (key,)
+        else:
+            return str(key)
+
+    def _parse_ordering(self, ordering):
+        """Normalize the 'ordering' option into a list of edges.
+
+        Each edge is a (src, dst) pair expressing that the item identified
+        by src must appear before the item identified by dst.
+        """
+
+        def as_id_list(value):
+            if isinstance(value, list):
+                return value
+            else:
+                return [value]
+
+        edges = []
+
+        if isinstance(ordering, list):
+            for edge in ordering:
+                if not isinstance(edge, dict):
+                    raise SchemaError("'ordering' option must be a list of "
+                            "objects with 'id' and 'before'/'after' keys")
+                src = edge.get('id')
+                for key in edge:
+                    if key not in ('id', 'before', 'after'):
+                        raise SchemaError("Unknown 'ordering' edge key '%s'"
+                                % (key,))
+                for dst in as_id_list(edge.get('before', [])):
+                    edges.append((src, dst))
+                for dst in as_id_list(edge.get('after', [])):
+                    edges.append((dst, src))
+        elif isinstance(ordering, dict):
+            for src, relations in ordering.items():
+                if not isinstance(relations, dict):
+                    raise SchemaError("Relations for item '%s' in 'ordering' "
+                            "option must be an object" % (src,))
+                for key in relations:
+                    if key not in ('before', 'after'):
+                        raise SchemaError("Unknown 'ordering' relation key "
+                                "'%s'" % (key,))
+                for dst in as_id_list(relations.get('before', [])):
+                    edges.append((src, dst))
+                for dst in as_id_list(relations.get('after', [])):
+                    edges.append((dst, src))
+        else:
+            raise SchemaError("'ordering' option must be an object mapping "
+                    "item IDs to 'before'/'after' relations, or a list of "
+                    "edges")
+
+        return edges
+
+    def _find_cycle(self, succ, n):
+        """Return a list of node indices making up a cycle, or None."""
+
+        state = [0] * n
+        stack = []
+        stack_index = [-1] * n
+
+        def visit(u):
+            state[u] = 1
+            stack_index[u] = len(stack)
+            stack.append(u)
+
+            for v in succ[u]:
+                if state[v] == 0:
+                    cycle = visit(v)
+                    if cycle is not None:
+                        return cycle
+                elif state[v] == 1:
+                    return stack[stack_index[v]:] + [v]
+
+            stack.pop()
+            stack_index[u] = -1
+            state[u] = 2
+            return None
+
+        for u in range(n):
+            if state[u] == 0:
+                cycle = visit(u)
+                if cycle is not None:
+                    return cycle
+
+        return None
+
+    def _apply_ordering(self, walk, base, idRef, ordering, base_keys):
+        """Reorder the merged array to satisfy declared before/after edges.
+
+        The relative order is a stable topological sort: among items that
+        are simultaneously available, the item that appeared first in base
+        is picked first, followed by items newly introduced by head.
+        """
+
+        edges = self._parse_ordering(ordering)
+
+        nodes = list(range(len(base.val)))
+        keys = []
+        # Indices of the first occurrence of each ID. Matching is done by
+        # equality so that compound (list-valued) IDs are supported.
+        first_index = []
+
+        for i, item in enumerate(base):
+            try:
+                key = self.get_key(walk, item, idRef)
+            except jsonschema.RefResolutionError:
+                key = self._MISSING
+            keys.append(key)
+            if key is not self._MISSING:
+                if not any(key == keys[j] for j in first_index):
+                    first_index.append(i)
+
+        def from_base(key):
+            return any(key == base_key for base_key in base_keys)
+
+        def priority(i):
+            key = keys[i]
+            if key is self._MISSING or from_base(key):
+                return (0, i)
+            else:
+                return (1, i)
+
+        succ = [set() for _ in nodes]
+        indegree = [0] * len(nodes)
+
+        def resolve(key):
+            idx = next((j for j in first_index if key == keys[j]), None)
+            if idx is None:
+                raise OrderingError("'ordering' option references "
+                        "unknown item ID %s" % (self._format_id(key),),
+                        JSONValue(undef=True))
+            return idx
+
+        for src, dst in edges:
+            u = resolve(src)
+            v = resolve(dst)
+            if v not in succ[u]:
+                succ[u].add(v)
+                indegree[v] += 1
+
+        n = len(nodes)
+        available = [(priority(i), i) for i in nodes if indegree[i] == 0]
+        heapq.heapify(available)
+
+        ordered = []
+        while available:
+            _, u = heapq.heappop(available)
+            ordered.append(u)
+            for v in sorted(succ[u], key=priority):
+                indegree[v] -= 1
+                if indegree[v] == 0:
+                    heapq.heappush(available, (priority(v), v))
+
+        if len(ordered) != n:
+            cycle = self._find_cycle(succ, n)
+            cycle_ids = [self._format_id(keys[i]) for i in cycle]
+            raise OrderingError("'ordering' relations contain a cycle: "
+                    + " -> ".join(cycle_ids),
+                    JSONValue(undef=True))
+
+        base.val = [base.val[i] for i in ordered]
 
     def iter_index_key_item(self, walk, jv, idRef):
         for i, item in enumerate(jv):
@@ -218,11 +386,16 @@ class ArrayMergeById(ArrayStrategy):
 
             yield i, key, item
 
-    def _merge(self, walk, base, head, schema, idRef="id", ignoreId=None, sortByRef=None, sortReverse=None, **kwargs):
+    def _merge(self, walk, base, head, schema, idRef="id", ignoreId=None, sortByRef=None, sortReverse=None, ordering=None, **kwargs):
         subschema = schema.get('items')
 
         if walk.is_type(subschema, "array"):
             raise SchemaError("This strategy is not supported when 'items' is an array", subschema)
+
+        base_keys = []
+        for j, base_key, base_item in self.iter_index_key_item(walk, base, idRef):
+            if not any(base_key == key for key in base_keys):
+                base_keys.append(base_key)
 
         for i, key_1, item_1 in self.iter_index_key_item(walk, head, idRef):
             for j, key_2, item_2 in self.iter_index_key_item(walk, head, idRef):
@@ -255,7 +428,10 @@ class ArrayMergeById(ArrayStrategy):
                 j = matching_j[1]
                 raise BaseInstanceError("Id '%s' was not unique in base" % (base_key,), base[j])
 
-        self.sort_array(walk, base, sortByRef, sortReverse)
+        if ordering is not None:
+            self._apply_ordering(walk, base, idRef, ordering, base_keys)
+        else:
+            self.sort_array(walk, base, sortByRef, sortReverse)
 
         return base
 

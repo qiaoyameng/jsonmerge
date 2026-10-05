@@ -267,6 +267,27 @@ arrayMergeById
   *JSON pointer*. The pointer is resolved in the same way as *idRef*. Sort
   order can be reversed by setting the *sortReverse* option.
 
+  Alternatively, you can use the *ordering* merge option to declare
+  *before*/*after* relations between item IDs. The merged array is then
+  reordered to satisfy every declared relation while otherwise preserving
+  the stable merge order: items present in *base* keep the order of their
+  first occurrence there, and items newly introduced by *head* follow.
+  The option is either an object mapping an ID to its relations or a list
+  of edges::
+
+      # these two forms are equivalent
+      "ordering": {"a": {"before": ["b"], "after": ["c"]}}
+      "ordering": [
+          {"id": "a", "before": ["b"], "after": ["c"]}
+      ]
+
+  Relations are metadata supplied with the merge option; they are not
+  written into the merged items. A relation that references an ID absent
+  from the merged array, or a set of relations that contains a cycle,
+  raises an *OrderingError* listing the offending ID or the cycle (e.g.
+  ``'a' -> 'b' -> 'c' -> 'a'``). When *ordering* is given, *sortByRef* is
+  ignored.
+
 arrayMergeByIndex
   Merge array items by their index in the array. Similarly to
   *arrayMergeById* strategy, the resulting arrays have items from both

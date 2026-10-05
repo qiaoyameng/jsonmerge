@@ -23,3 +23,11 @@ class JSONMergeError(Exception):
 class BaseInstanceError(JSONMergeError): pass
 class HeadInstanceError(JSONMergeError): pass
 class SchemaError(JSONMergeError): pass
+
+class OrderingError(JSONMergeError):
+	"""Raised when the 'ordering' option cannot be satisfied.
+
+	This happens when a declared relation references an ID that does not
+	occur in the merged array or when the relations contain a cycle.
+	"""
+	pass
