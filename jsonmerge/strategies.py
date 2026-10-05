@@ -4,7 +4,6 @@ from jsonmerge.exceptions import HeadInstanceError, \
                                  SchemaError
 from jsonmerge.jsonvalue import JSONValue
 import jsonschema
-import re
 
 class Strategy(object):
     """Base class for merge strategies.
@@ -325,22 +324,8 @@ class ObjectMerge(Strategy):
 
             # get subschema for this element
             if not schema.is_undef():
-                p = schema.get('properties')
-                if not p.is_undef():
-                    subschema = p.get(k)
-
-                if subschema.is_undef():
-                    p = schema.get('patternProperties')
-                    if not p.is_undef():
-                        for pattern, s in p.items():
-                            if re.search(pattern, k):
-                                subschema = s
-
-                if subschema.is_undef():
-                    p = schema.get('additionalProperties')
-                    # additionalProperties can be boolean in draft 4
-                    if not p.is_undef() and walk.is_type(p, "object"):
-                        subschema = p
+                subschema = walk.resolve_property_subschema(
+                        schema, k, base.get(k), v)
 
             base[k] = walk.descend(subschema, base.get(k), v)
 
@@ -355,7 +340,17 @@ class ObjectMerge(Strategy):
                 for k, v in p.items():
                     schema2[keyword][k] = walk.descend(v)
 
-        descend_keyword("properties")
+        if walk.strict_strategy_resolution:
+            p = schema.get("properties")
+            if not p.is_undef():
+                for k in p.val.keys():
+                    effective = walk.resolve_property_subschema(
+                            schema, k, head=None)
+                    if not effective.is_undef():
+                        schema2["properties"][k] = walk.descend(effective)
+        else:
+            descend_keyword("properties")
+
         descend_keyword("patternProperties")
 
        # additionalProperties can be boolean in draft 4

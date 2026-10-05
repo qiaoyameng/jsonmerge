@@ -2,6 +2,7 @@
 import unittest
 import warnings
 import sys
+import copy
 
 from collections import OrderedDict
 import jsonmerge
@@ -462,6 +463,141 @@ class TestMerge(unittest.TestCase):
         base = jsonmerge.merge(base, {'a': ["b"], 'b': 'c'}, schema)
 
         self.assertEqual(base, {'a': ["a", "b"], 'b': 'c'})
+
+    def test_strict_combines_matching_rules_independent_of_order(self):
+
+        base = {
+            'foo': [{'id': 'z'}],
+            'untouched': [1],
+        }
+        head = {'foo': [{'id': 'a'}]}
+
+        def schema(pattern_order):
+            patterns = [
+                ('^f', {
+                    'type': 'array',
+                    'mergeStrategy': 'append',
+                    'mergeOptions': {'sortReverse': False},
+                }),
+                ('oo$', {
+                    'type': 'array',
+                    'mergeStrategy': 'append',
+                    'mergeOptions': {'sortByRef': 'id'},
+                }),
+            ]
+            if pattern_order == 2:
+                patterns.reverse()
+
+            return {
+                'properties': {
+                    'foo': {
+                        'type': 'array',
+                        'mergeStrategy': 'append',
+                    }
+                },
+                'patternProperties': dict(patterns),
+                'additionalProperties': {
+                    'mergeStrategy': 'overwrite',
+                },
+            }
+
+        expected = {'foo': [{'id': 'a'}, {'id': 'z'}], 'untouched': [1]}
+
+        result_1 = jsonmerge.Merger(
+                schema(1), strict_strategy_resolution=True).merge(
+                        copy.deepcopy(base), copy.deepcopy(head))
+        result_2 = jsonmerge.Merger(
+                schema(2), strict_strategy_resolution=True).merge(
+                        copy.deepcopy(base), copy.deepcopy(head))
+
+        self.assertEqual(result_1, expected)
+        self.assertEqual(result_2, expected)
+
+    def test_strict_conflicting_property_rules_reports_locations(self):
+
+        schema = {
+            'properties': {
+                'foo': {'mergeStrategy': 'append'},
+            },
+            'patternProperties': {
+                'oo': {'mergeStrategy': 'overwrite'},
+            },
+        }
+
+        base = {'foo': [1]}
+        head = {'foo': [2]}
+
+        merger = jsonmerge.Merger(schema,
+                strict_strategy_resolution=True)
+
+        with self.assertRaises(SchemaError) as cm:
+            merger.merge(copy.deepcopy(base), copy.deepcopy(head))
+
+        message = str(cm.exception)
+        self.assertIn('#/properties/foo', message)
+        self.assertIn('#/patternProperties/oo', message)
+        self.assertIn('append', message)
+        self.assertIn('overwrite', message)
+        self.assertEqual(base, {'foo': [1]})
+
+    def test_strict_conflicting_recursive_rules_fail_before_modification(self):
+
+        schema = {
+            'properties': {
+                'a': {'$ref': '#/definitions/node'},
+            },
+            'definitions': {
+                'node': {
+                    'type': 'object',
+                    'properties': {
+                        'foo': {'mergeStrategy': 'append'},
+                        'child': {'$ref': '#/definitions/node'},
+                    },
+                    'patternProperties': {
+                        'oo': {'mergeStrategy': 'overwrite'},
+                    },
+                },
+            },
+        }
+
+        base = {'a': {'foo': [1], 'child': {'foo': [2]}}}
+        head = {'a': {'foo': [3], 'child': {'foo': [4]}}}
+
+        merger = jsonmerge.Merger(schema,
+                strict_strategy_resolution=True)
+
+        with self.assertRaises(SchemaError) as cm:
+            merger.merge(copy.deepcopy(base), copy.deepcopy(head))
+
+        message = str(cm.exception)
+        self.assertIn('#/definitions/node/properties/foo', message)
+        self.assertIn('#/definitions/node/patternProperties/oo', message)
+        self.assertEqual(base, {'a': {'foo': [1], 'child': {'foo': [2]}}})
+
+    def test_strict_conflicting_rules_in_array_item_fail_before_modification(self):
+
+        schema = {
+            'mergeStrategy': 'arrayMergeById',
+            'items': {
+                'properties': {
+                    'foo': {'mergeStrategy': 'append'},
+                },
+                'patternProperties': {
+                    'oo': {'mergeStrategy': 'overwrite'},
+                },
+            },
+        }
+
+        base = [{'id': 'a', 'foo': [1]}]
+        head = [{'id': 'a', 'foo': [2]}]
+
+        merger = jsonmerge.Merger(schema,
+                strict_strategy_resolution=True)
+
+        with self.assertRaises(SchemaError):
+            merger.merge(copy.deepcopy(base), copy.deepcopy(head))
+
+        self.assertEqual(base, [{'id': 'a', 'foo': [1]}])
 
     def test_merge_additional_bool(self):
 
@@ -2459,6 +2595,109 @@ class TestGetSchema(unittest.TestCase):
         schema2 = merger.get_schema()
 
         self.assertEqual(schema2, expected)
+
+    def test_strict_get_schema_combines_matching_rules(self):
+
+        def schema(pattern_order):
+            patterns = [
+                ('^f', {
+                    'type': 'array',
+                    'mergeStrategy': 'append',
+                    'mergeOptions': {'sortReverse': False},
+                }),
+                ('oo$', {
+                    'type': 'array',
+                    'mergeStrategy': 'append',
+                    'mergeOptions': {'sortByRef': 'id'},
+                }),
+            ]
+            if pattern_order == 2:
+                patterns.reverse()
+
+            return {
+                'properties': {
+                    'foo': {
+                        'type': 'array',
+                        'mergeStrategy': 'append',
+                    }
+                },
+                'patternProperties': dict(patterns),
+            }
+
+        schema_1 = jsonmerge.Merger(
+                schema(1),
+                strict_strategy_resolution=True).get_schema()
+        schema_2 = jsonmerge.Merger(
+                schema(2),
+                strict_strategy_resolution=True).get_schema()
+
+        expected = {
+            'properties': {
+                'foo': {
+                    'type': 'array',
+                }
+            },
+            'patternProperties': {
+                '^f': {'type': 'array'},
+                'oo$': {'type': 'array'},
+            },
+        }
+
+        self.assertEqual(schema_1, expected)
+        self.assertEqual(schema_2, expected)
+
+    def test_strict_get_schema_conflicting_rules_reports_locations(self):
+
+        schema = {
+            'properties': {
+                'foo': {'mergeStrategy': 'append'},
+            },
+            'patternProperties': {
+                'oo': {'mergeStrategy': 'overwrite'},
+            },
+        }
+
+        original = copy.deepcopy(schema)
+        merger = jsonmerge.Merger(schema,
+                strict_strategy_resolution=True)
+
+        with self.assertRaises(SchemaError) as cm:
+            merger.get_schema()
+
+        message = str(cm.exception)
+        self.assertIn('#/properties/foo', message)
+        self.assertIn('#/patternProperties/oo', message)
+        self.assertEqual(schema, original)
+
+    def test_strict_get_schema_recursive_ref_conflict(self):
+
+        schema = {
+            'properties': {
+                'a': {'$ref': '#/definitions/node'},
+            },
+            'definitions': {
+                'node': {
+                    'type': 'object',
+                    'properties': {
+                        'foo': {'mergeStrategy': 'append'},
+                        'child': {'$ref': '#/definitions/node'},
+                    },
+                    'patternProperties': {
+                        'oo': {'mergeStrategy': 'overwrite'},
+                    },
+                },
+            },
+        }
+
+        merger = jsonmerge.Merger(schema,
+                strict_strategy_resolution=True)
+
+        with self.assertRaises(SchemaError) as cm:
+            merger.get_schema()
+
+        message = str(cm.exception)
+        self.assertIn('#/definitions/node/properties/foo', message)
+        self.assertIn('#/definitions/node/patternProperties/oo', message)
 
     def test_merge_additional_bool(self):
 

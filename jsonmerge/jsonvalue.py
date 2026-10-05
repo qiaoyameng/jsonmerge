@@ -7,11 +7,12 @@ else:
     text_type = unicode
 
 class JSONValue(object):
-    def __init__(self, val=None, ref='#', undef=False):
+    def __init__(self, val=None, ref='#', undef=False, resolved=False):
         assert not isinstance(val, JSONValue)
         self.val = val
         self.ref = ref
         self.undef = undef
+        self.resolved = resolved
 
     def is_undef(self):
         return self.undef

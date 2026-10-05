@@ -360,6 +360,16 @@ validatorclass
     as reference resolution are different between versions. By default, the
     Draft 4 validator is used.
 
+strict_strategy_resolution
+    When enabled, *objectMerge* collects every *properties* and
+    *patternProperties* rule that matches a key. Rules with the same merge
+    strategy and compatible *mergeOptions* are combined. Conflicting
+    strategies or options raise a *SchemaError* that lists every involved
+    schema location. *additionalProperties* is used only when neither of the
+    other two keywords matches. This check also applies to recursive
+    properties, *$ref* and *get_schema()*, and conflicts are reported before
+    an input object is modified.
+
 
 Support for keywords that apply subschemas
 ------------------------------------------
