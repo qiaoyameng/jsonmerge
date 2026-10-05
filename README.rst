@@ -267,6 +267,36 @@ arrayMergeById
   *JSON pointer*. The pointer is resolved in the same way as *idRef*. Sort
   order can be reversed by setting the *sortReverse* option.
 
+arrayMergeByIdWithDeletes
+  Merge arrays like *arrayMergeById*, with additional support for explicit
+  deletion of items by ID. Instead of a bare array, *head* must be an
+  object with update and delete directives, kept separate from the merged
+  items themselves::
+
+    {"upsert": [<item>, ...], "delete": [<id>, ...]}
+
+  Items in the *upsert* directive are merged into the *base* array exactly
+  as with *arrayMergeById*: matching items are merged based on the
+  strategy specified further down in the hierarchy, items not present in
+  *base* are appended in input order and surviving *base* items keep their
+  original order. IDs listed in the *delete* directive remove the matching
+  item from the *base* array. Both directives are optional.
+
+  Because deletion is only ever requested through the *delete* directive,
+  an item is never treated as a deletion request based on its content
+  (e.g. a *null* value or a property that happens to be named like a
+  directive). IDs are compared using JSON type semantics, so values of
+  different JSON types are never considered equal (e.g. *true* and *1*
+  identify different items).
+
+  If the same ID appears in both *upsert* and *delete* in a single merge,
+  the merge fails. Deleting an ID that is not present in *base* also
+  fails, unless the *ignoreMissingDeletes* merge option is set to true.
+
+  The *upsertRef* and *deleteRef* merge options can be used to rename the
+  *upsert* and *delete* directives. The *idRef*, *sortByRef* and
+  *sortReverse* merge options work as with *arrayMergeById*.
+
 arrayMergeByIndex
   Merge array items by their index in the array. Similarly to
   *arrayMergeById* strategy, the resulting arrays have items from both

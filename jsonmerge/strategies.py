@@ -274,6 +274,140 @@ class ArrayMergeByIndex(ArrayMergeById):
             yield i, i, item
 
 
+class ArrayMergeByIdWithDeletes(ArrayMergeById):
+    """Merge arrays like arrayMergeById, but also support explicit deletion
+    of items by ID.
+
+    Instead of a bare array, head is expected to be an object with update
+    and delete directives, kept separate from the merged items themselves:
+
+        {"upsert": [ <item>, ... ], "delete": [ <id>, ... ]}
+
+    Items in "upsert" are merged into the base array exactly as with
+    arrayMergeById. IDs listed in "delete" remove the matching item from
+    the base array. An item is never interpreted as a deletion request
+    based on its content (e.g. a null value or a property that happens to
+    be named like a directive) - only IDs listed in the "delete" directive
+    delete.
+    """
+
+    def json_type_key(self, value):
+        """Return a hashable key for a JSON value, using JSON type semantics.
+
+        Values of different JSON types never produce equal keys, even if
+        they would compare equal in Python (e.g. true and 1).
+        """
+        if value is None:
+            return ('null', None)
+        if isinstance(value, bool):
+            return ('boolean', value)
+        if isinstance(value, (int, float)):
+            return ('number', value)
+        if isinstance(value, str):
+            return ('string', value)
+        if isinstance(value, list):
+            return ('array', tuple(self.json_type_key(v) for v in value))
+        if isinstance(value, dict):
+            return ('object', tuple(sorted(
+                (k, self.json_type_key(v)) for k, v in value.items())))
+        return ('value', value)
+
+    def merge(self, walk, base, head, schema, idRef="id", upsertRef="upsert",
+              deleteRef="delete", ignoreMissingDeletes=False, sortByRef=None,
+              sortReverse=None, **kwargs):
+        if not walk.is_type(head, "object"):
+            raise HeadInstanceError(
+                    "Head is not an object with '%s' and '%s' directives" %
+                    (upsertRef, deleteRef), head)
+
+        upserts = head.get(upsertRef)
+        deletes = head.get(deleteRef)
+
+        if not upserts.is_undef() and not walk.is_type(upserts, "array"):
+            raise HeadInstanceError("'%s' directive is not an array" % (upsertRef,), upserts)
+
+        if not deletes.is_undef() and not walk.is_type(deletes, "array"):
+            raise HeadInstanceError("'%s' directive is not an array" % (deleteRef,), deletes)
+
+        if base.is_undef():
+            base = JSONValue([], base.ref)
+        else:
+            if not walk.is_type(base, "array"):
+                raise BaseInstanceError("Base is not an array", base)
+
+            base = JSONValue(list(base.val), base.ref)
+
+        subschema = schema.get('items')
+
+        if walk.is_type(subschema, "array"):
+            raise SchemaError("This strategy is not supported when 'items' is an array", subschema)
+
+        upsert_order = []
+        upsert_by_key = {}
+        if not upserts.is_undef():
+            for i, head_key, head_item in self.iter_index_key_item(walk, upserts, idRef):
+                tkey = self.json_type_key(head_key)
+                if tkey in upsert_by_key:
+                    raise HeadInstanceError("Id '%s' was not unique in head" % (head_key,), head_item)
+                upsert_by_key[tkey] = head_item
+                upsert_order.append(tkey)
+
+        delete_keys = {}
+        if not deletes.is_undef():
+            for delete_item in deletes:
+                delete_keys.setdefault(self.json_type_key(delete_item.val), delete_item.val)
+
+        for tkey, head_item in upsert_by_key.items():
+            if tkey in delete_keys:
+                raise HeadInstanceError(
+                        "Id '%s' is both updated and deleted in the same merge" %
+                        (delete_keys[tkey],), head_item)
+
+        kept = []
+        seen_base_keys = set()
+        deleted_keys = set()
+        merged_keys = set()
+
+        for base_item in base:
+            try:
+                base_key = self.get_key(walk, base_item, idRef)
+            except jsonschema.RefResolutionError:
+                kept.append(base_item)
+                continue
+
+            tkey = self.json_type_key(base_key)
+
+            if tkey in seen_base_keys:
+                raise BaseInstanceError("Id '%s' was not unique in base" % (base_key,), base_item)
+            seen_base_keys.add(tkey)
+
+            if tkey in delete_keys:
+                deleted_keys.add(tkey)
+            elif tkey in upsert_by_key:
+                merged_keys.add(tkey)
+                kept.append(walk.descend(subschema, base_item, upsert_by_key[tkey]))
+            else:
+                kept.append(base_item)
+
+        for tkey, delete_key in delete_keys.items():
+            if tkey not in deleted_keys and not ignoreMissingDeletes:
+                raise BaseInstanceError(
+                        "Id '%s' scheduled for deletion was not found in base" %
+                        (delete_key,), base)
+
+        for tkey in upsert_order:
+            if tkey not in merged_keys:
+                kept.append(walk.descend(subschema, JSONValue(undef=True), upsert_by_key[tkey]))
+
+        rv = JSONValue([], base.ref)
+        for item in kept:
+            rv.append(item)
+
+        self.sort_array(walk, rv, sortByRef, sortReverse)
+
+        return rv
+
+
 class ObjectMerge(Strategy):
     """A Strategy for merging objects.
 
