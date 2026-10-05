@@ -274,6 +274,34 @@ arrayMergeByIndex
   arrays will be merged based on the strategy specified further down in the
   hierarchy.
 
+discriminator
+  Select a registered subschema for merging an object based on the value
+  of a discriminator field. This is useful when items of an array can be
+  one of several types (e.g. *text*, *image* or *link*), each with its own
+  merge strategies. The branch to use is chosen explicitly by the
+  discriminator value, not by trying which subschema of *anyOf* or *oneOf*
+  happens to validate.
+
+  The *field* option names the object property used as the discriminator
+  (default *type*). The *mapping* option must map each possible
+  discriminator value to a schema. If *base* and *head* select the same
+  branch, they are merged recursively using that branch's schema. If they
+  select different branches, the *onTypeChange* option controls the
+  result: *replace* (the default) replaces the whole item with *head*
+  merged as if *base* was undefined, so that no state from the old branch
+  (e.g. version history of a text item) leaks into the new one. *reject*
+  raises an error instead.
+
+  An object without the discriminator field, or with a value that has no
+  registered schema, raises an error that points to the object's location
+  in the document. The same is true for unresolvable schema references in
+  the selected branch.
+
+  The schema returned for the merged document contains a *oneOf* keyword
+  with the schemas of all registered branches, transformed according to
+  the strategies they use (e.g. *version* changes the type of a value to
+  an array).
+
 objectMerge
   Merge objects. Resulting objects have properties from both *base* and
   *head*. Any properties that are present both in *base* and *head* are

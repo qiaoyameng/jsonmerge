@@ -3,6 +3,7 @@ import unittest
 import warnings
 import sys
 
+import copy
 from collections import OrderedDict
 import jsonmerge
 import jsonmerge.strategies
@@ -2643,6 +2644,251 @@ class TestGetSchema(unittest.TestCase):
             merger.merge(base, head)
 
         self.assertIn('arrayMergeByIndex', str(cm.exception))
+
+class TestDiscriminator(unittest.TestCase):
+
+    def make_mapping(self):
+        return {
+            'text': {
+                'mergeStrategy': 'objectMerge',
+                'required': ['type'],
+                'properties': {
+                    'type': {'enum': ['text']},
+                    'body': {'mergeStrategy': 'overwrite'},
+                },
+            },
+            'image': {
+                'mergeStrategy': 'objectMerge',
+                'required': ['type'],
+                'properties': {
+                    'type': {'enum': ['image']},
+                    'url': {'mergeStrategy': 'version'},
+                },
+            },
+            'link': {
+                'mergeStrategy': 'objectMerge',
+                'required': ['type'],
+                'properties': {
+                    'type': {'enum': ['link']},
+                    'href': {'mergeStrategy': 'overwrite'},
+                },
+            },
+        }
+
+    def make_schema(self, mapping, **options):
+        # Two levels of nested arrays with mixed-type items.
+        opts = {'field': 'type', 'mapping': mapping}
+        opts.update(options)
+        return {
+            'mergeStrategy': 'arrayMergeByIndex',
+            'items': {
+                'mergeStrategy': 'arrayMergeByIndex',
+                'items': {
+                    'mergeStrategy': 'discriminator',
+                    'mergeOptions': opts,
+                },
+            },
+        }
+
+    def test_merge_nested_arrays(self):
+        mapping = self.make_mapping()
+        schema = self.make_schema(mapping)
+
+        merger = jsonmerge.Merger(schema)
+
+        base = None
+        base = merger.merge(base, [
+            [{'type': 'text', 'body': 'a'}, {'type': 'image', 'url': 'u1'}],
+            [{'type': 'link', 'href': 'h1'}],
+        ])
+        base = merger.merge(base, [
+            [{'type': 'text', 'body': 'b'}, {'type': 'image', 'url': 'u2'}],
+            [{'type': 'link', 'href': 'h2'}],
+        ])
+
+        expected = [
+            [{'type': 'text', 'body': 'b'},
+             {'type': 'image', 'url': [{'value': 'u1'}, {'value': 'u2'}]}],
+            [{'type': 'link', 'href': 'h2'}],
+        ]
+
+        self.assertEqual(base, expected)
+
+    def test_get_schema_nested_arrays(self):
+        mapping = self.make_mapping()
+        schema = self.make_schema(mapping)
+
+        merger = jsonmerge.Merger(schema)
+
+        base = None
+        base = merger.merge(base, [
+            [{'type': 'text', 'body': 'a'}, {'type': 'image', 'url': 'u1'}],
+            [{'type': 'link', 'href': 'h1'}],
+        ])
+        base = merger.merge(base, [
+            [{'type': 'text', 'body': 'b'}, {'type': 'image', 'url': 'u2'}],
+            [{'type': 'link', 'href': 'h2'}],
+        ])
+
+        schema2 = merger.get_schema()
+
+        # Merged instance must validate against the generated schema.
+        jsonschema.validate(base, schema2)
+
+        # All possible result branches must be expressed.
+        branches = schema2['items']['items']['oneOf']
+        self.assertEqual(len(branches), 3)
+
+        by_type = {}
+        for branch in branches:
+            by_type[branch['properties']['type']['enum'][0]] = branch
+
+        self.assertEqual(set(by_type), set(['text', 'image', 'link']))
+
+        # The internal version strategy changed the structure of 'url'.
+        self.assertEqual(by_type['image']['properties']['url'], {
+            'type': 'array',
+            'items': {'properties': {'value': {}}},
+        })
+
+        # mergeStrategy/mergeOptions keywords must not leak into the result.
+        for branch in branches:
+            self.assertNotIn('mergeStrategy', branch)
+            self.assertNotIn('mergeOptions', branch)
+
+    def test_shared_schema_not_modified(self):
+        mapping = self.make_mapping()
+        schema = self.make_schema(mapping)
+
+        schema_snapshot = copy.deepcopy(schema)
+        mapping_snapshot = copy.deepcopy(mapping)
+
+        merger = jsonmerge.Merger(schema)
+
+        base = None
+        base = merger.merge(base, [[{'type': 'image', 'url': 'u1'}]])
+        base = merger.merge(base, [[{'type': 'image', 'url': 'u2'}]])
+
+        schema2 = merger.get_schema()
+        jsonschema.validate(base, schema2)
+
+        # Branch selection must not modify the registered (shared) schema
+        # objects, nor any other part of the merge schema.
+        self.assertIs(schema['items']['items']['mergeOptions']['mapping'], mapping)
+        self.assertEqual(mapping, mapping_snapshot)
+        self.assertEqual(schema, schema_snapshot)
+
+    def test_type_change_replace(self):
+        mapping = self.make_mapping()
+        schema = self.make_schema(mapping, onTypeChange='replace')
+
+        merger = jsonmerge.Merger(schema)
+
+        base = merger.merge(None, [[{'type': 'text', 'body': 'a'}]])
+        base = merger.merge(base, [[{'type': 'image', 'url': 'u1'}]])
+
+        # The whole item is replaced: no 'body' from the text branch may
+        # leak into the image item.
+        self.assertEqual(base, [[{'type': 'image', 'url': [{'value': 'u1'}]}]])
+
+    def test_type_change_reject(self):
+        mapping = self.make_mapping()
+        schema = self.make_schema(mapping, onTypeChange='reject')
+
+        merger = jsonmerge.Merger(schema)
+
+        base = merger.merge(None, [[{'type': 'text', 'body': 'a'}]])
+
+        with self.assertRaises(HeadInstanceError) as cm:
+            merger.merge(base, [[{'type': 'image', 'url': 'u1'}]])
+
+        self.assertEqual(cm.exception.value.ref, '#/0/0')
+
+    def test_missing_discriminator_head(self):
+        mapping = self.make_mapping()
+        schema = self.make_schema(mapping)
+
+        merger = jsonmerge.Merger(schema)
+
+        with self.assertRaises(HeadInstanceError) as cm:
+            merger.merge(None, [[{'body': 'a'}]])
+
+        self.assertEqual(cm.exception.value.ref, '#/0/0')
+        self.assertIn('#/0/0', str(cm.exception))
+
+    def test_missing_discriminator_base(self):
+        mapping = self.make_mapping()
+        schema = self.make_schema(mapping)
+
+        merger = jsonmerge.Merger(schema)
+
+        with self.assertRaises(BaseInstanceError) as cm:
+            merger.merge([[{}]], [[{'type': 'text', 'body': 'a'}]])
+
+        self.assertEqual(cm.exception.value.ref, '#/0/0')
+
+    def test_unknown_discriminator_value(self):
+        mapping = self.make_mapping()
+        schema = self.make_schema(mapping)
+
+        merger = jsonmerge.Merger(schema)
+
+        with self.assertRaises(HeadInstanceError) as cm:
+            merger.merge(None, [[{'type': 'video'}]])
+
+        self.assertEqual(cm.exception.value.ref, '#/0/0')
+        self.assertIn('video', str(cm.exception))
+
+    def test_unresolvable_ref_points_to_data(self):
+        mapping = self.make_mapping()
+        mapping['text'] = {'$ref': '#/definitions/missing'}
+        schema = self.make_schema(mapping)
+
+        merger = jsonmerge.Merger(schema)
+
+        with self.assertRaises(SchemaError) as cm:
+            merger.merge(None, [[{'type': 'text', 'body': 'a'}]])
+
+        self.assertIn('#/0/0', str(cm.exception))
+
+    def test_invalid_options(self):
+        mapping = self.make_mapping()
+
+        schema = self.make_schema(mapping, onTypeChange='explode')
+        merger = jsonmerge.Merger(schema)
+        with self.assertRaises(SchemaError):
+            merger.merge(None, [[{'type': 'text', 'body': 'a'}]])
+
+        schema = self.make_schema(mapping)
+        del schema['items']['items']['mergeOptions']['mapping']
+        merger = jsonmerge.Merger(schema)
+        with self.assertRaises(SchemaError):
+            merger.merge(None, [[{'type': 'text', 'body': 'a'}]])
+
+    def test_mapping_from_merge_options(self):
+        # The mapping can also be supplied through merger-level
+        # merge_options instead of the schema document.
+        schema = {'mergeStrategy': 'discriminator'}
+
+        merger = jsonmerge.Merger(schema)
+
+        merge_options = {'discriminator': {
+            'field': 'type',
+            'mapping': self.make_mapping(),
+        }}
+
+        base = merger.merge(None, {'type': 'text', 'body': 'a'},
+                merge_options=merge_options)
+        base = merger.merge(base, {'type': 'text', 'body': 'b'},
+                merge_options=merge_options)
+
+        self.assertEqual(base, {'type': 'text', 'body': 'b'})
+
+        schema2 = merger.get_schema(merge_options=merge_options)
+        self.assertEqual(len(schema2['oneOf']), 3)
+
+        jsonschema.validate(base, schema2)
+
 
 class TestExceptions(unittest.TestCase):
     def test_str_with_ref(self):
