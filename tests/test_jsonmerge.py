@@ -2,6 +2,7 @@
 import unittest
 import warnings
 import sys
+import copy
 
 from collections import OrderedDict
 import jsonmerge
@@ -1653,6 +1654,380 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(result, [ {'c': 2}, {'d': 3} ])
 
 
+class TestDeletionProtocol(unittest.TestCase):
+    """Tests for the opt-in explicit deletion protocol."""
+
+    OBJECT_SCHEMA = {
+        'mergeStrategy': 'objectMerge',
+        'mergeOptions': {'enableDelete': True},
+    }
+
+    ARRAY_SCHEMA = {
+        'properties': {
+            'items': {
+                'type': 'array',
+                'mergeStrategy': 'arrayMergeById',
+                'mergeOptions': {'enableDelete': True},
+                'items': {
+                    'properties': {
+                        'id': {'type': 'string'},
+                        'field': {'type': ['number', 'null']},
+                    }
+                },
+            }
+        }
+    }
+
+    # -- default behavior is unchanged when the protocol is off -----------
+
+    def test_disabled_by_default_marker_is_plain_data(self):
+        schema = {
+            'mergeStrategy': 'objectMerge',
+            'properties': {'a': {'mergeStrategy': 'overwrite'}},
+        }
+        base = {'a': 1}
+        head = {'a': {'__delete__': None}}
+
+        result = jsonmerge.merge(base, head, schema)
+
+        self.assertEqual(result, {'a': {'__delete__': None}})
+
+    def test_strict_without_enable_is_schema_error(self):
+        schema = {
+            'mergeStrategy': 'objectMerge',
+            'mergeOptions': {'strictDelete': True},
+        }
+        merger = jsonmerge.Merger(schema)
+
+        with self.assertRaises(SchemaError):
+            merger.merge({'a': 1}, {'a': None})
+
+    # -- object member deletion -------------------------------------------
+
+    def test_object_delete_member(self):
+        merger = jsonmerge.Merger(self.OBJECT_SCHEMA)
+        base = merger.merge(None, {'a': 1, 'b': 2})
+
+        base = merger.merge(base, {'a': {'__delete__': None}})
+
+        self.assertEqual(base, {'b': 2})
+
+    def test_object_null_is_distinct_from_delete(self):
+        merger = jsonmerge.Merger(self.OBJECT_SCHEMA)
+
+        deleted = merger.merge({'a': 1, 'b': 2},
+                               {'a': {'__delete__': None}})
+        nulled = merger.merge({'a': 1, 'b': 2}, {'a': None})
+
+        # A missing field and an explicit null produce different results.
+        self.assertEqual(deleted, {'b': 2})
+        self.assertEqual(nulled, {'a': None, 'b': 2})
+
+    def test_object_three_increments_add_delete_reappear(self):
+        merger = jsonmerge.Merger(self.OBJECT_SCHEMA)
+
+        base = merger.merge(None, {'k': 'v1'})
+        self.assertEqual(base, {'k': 'v1'})
+
+        base = merger.merge(base, {'k': {'__delete__': None}})
+        self.assertEqual(base, {})
+
+        base = merger.merge(base, {'k': 'v2'})
+        self.assertEqual(base, {'k': 'v2'})
+
+    def test_object_delete_missing_is_idempotent_by_default(self):
+        merger = jsonmerge.Merger(self.OBJECT_SCHEMA)
+
+        base = merger.merge({'a': 1}, {'zzz': {'__delete__': None}})
+
+        self.assertEqual(base, {'a': 1})
+
+    def test_object_delete_missing_strict_raises(self):
+        schema = {
+            'mergeStrategy': 'objectMerge',
+            'mergeOptions': {'enableDelete': True, 'strictDelete': True},
+        }
+        merger = jsonmerge.Merger(schema)
+
+        with self.assertRaises(BaseInstanceError):
+            merger.merge({'a': 1}, {'zzz': {'__delete__': None}})
+
+    def test_object_malformed_marker_rejected_before_any_change(self):
+        merger = jsonmerge.Merger(self.OBJECT_SCHEMA)
+        base = {'a': 1, 'b': 2}
+        head = {'a': {'__delete__': 1}, 'b': {'__delete__': None}}
+        base_snapshot = copy.deepcopy(base)
+        head_snapshot = copy.deepcopy(head)
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(base, head)
+
+        # Nothing was deleted before the error and inputs are untouched.
+        self.assertEqual(base, base_snapshot)
+        self.assertEqual(head, head_snapshot)
+
+    def test_object_marker_never_leaks_into_output(self):
+        merger = jsonmerge.Merger(self.OBJECT_SCHEMA)
+
+        base = merger.merge(None, {'a': 1})
+        base = merger.merge(base, {'a': {'__delete__': None}})
+
+        self.assertNotIn('__delete__', base)
+        self.assertNotIn('__escaped__', base)
+
+    # -- escaping of user data that looks like a marker -------------------
+
+    def test_object_escape_preserves_marker_like_value(self):
+        merger = jsonmerge.Merger(self.OBJECT_SCHEMA)
+
+        base = merger.merge(
+            None, {'a': {'__escaped__': {'__delete__': None}}})
+
+        self.assertEqual(base, {'a': {'__delete__': None}})
+        self.assertNotIn('__escaped__', base['a'])
+
+    def test_object_escape_marker_with_extra_property_rejected(self):
+        merger = jsonmerge.Merger(self.OBJECT_SCHEMA)
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(None, {'a': {'__escaped__': {}, 'extra': 1}})
+
+    # -- arrayMergeById member deletion -----------------------------------
+
+    def test_array_delete_member(self):
+        merger = jsonmerge.Merger(self.ARRAY_SCHEMA)
+        base = merger.merge(
+            None, {'items': [{'id': 'A', 'field': 1},
+                             {'id': 'B', 'field': 2}]})
+
+        base = merger.merge(base, {'items': [{'id': 'A',
+                                              '__delete__': None}]})
+
+        self.assertEqual(base, {'items': [{'id': 'B', 'field': 2}]})
+
+    def test_array_null_field_is_distinct_from_member_delete(self):
+        merger = jsonmerge.Merger(self.ARRAY_SCHEMA)
+
+        deleted = merger.merge(
+            {'items': [{'id': 'A', 'field': 1}]},
+            {'items': [{'id': 'A', '__delete__': None}]})
+
+        nulled = merger.merge(
+            {'items': [{'id': 'A', 'field': 1}]},
+            {'items': [{'id': 'A', 'field': None}]})
+
+        self.assertEqual(deleted, {'items': []})
+        self.assertEqual(nulled, {'items': [{'id': 'A', 'field': None}]})
+
+    def test_array_three_increments_add_delete_reappear(self):
+        merger = jsonmerge.Merger(self.ARRAY_SCHEMA)
+
+        base = merger.merge(None, {'items': [{'id': 'A', 'field': 1}]})
+        self.assertEqual(base, {'items': [{'id': 'A', 'field': 1}]})
+
+        base = merger.merge(
+            base, {'items': [{'id': 'A', '__delete__': None}]})
+        self.assertEqual(base, {'items': []})
+
+        base = merger.merge(
+            base, {'items': [{'id': 'A', 'field': 2}]})
+        self.assertEqual(base, {'items': [{'id': 'A', 'field': 2}]})
+
+    def test_array_delete_missing_id_is_idempotent_by_default(self):
+        merger = jsonmerge.Merger(self.ARRAY_SCHEMA)
+
+        base = merger.merge(
+            {'items': [{'id': 'A'}]},
+            {'items': [{'id': 'Z', '__delete__': None}]})
+
+        self.assertEqual(base, {'items': [{'id': 'A'}]})
+
+    def test_array_delete_missing_id_strict_raises(self):
+        schema = copy.deepcopy(self.ARRAY_SCHEMA)
+        schema['properties']['items']['mergeOptions']['strictDelete'] = True
+        merger = jsonmerge.Merger(schema)
+
+        with self.assertRaises(BaseInstanceError):
+            merger.merge(
+                {'items': [{'id': 'A'}]},
+                {'items': [{'id': 'Z', '__delete__': None}]})
+
+    def test_array_duplicate_id_rejected_before_any_deletion(self):
+        merger = jsonmerge.Merger(self.ARRAY_SCHEMA)
+        base = {'items': [{'id': 'A', 'field': 1},
+                          {'id': 'B', 'field': 2}]}
+        head = {'items': [{'id': 'A', '__delete__': None},
+                          {'id': 'A', 'field': 5}]}
+        base_snapshot = copy.deepcopy(base)
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(base, head)
+
+        self.assertEqual(base, base_snapshot)
+
+    def test_array_malformed_marker_rejected_before_any_change(self):
+        merger = jsonmerge.Merger(self.ARRAY_SCHEMA)
+        base = {'items': [{'id': 'A', 'field': 1}]}
+        head = {'items': [{'id': 'A', 'x': 1, '__delete__': None}]}
+        base_snapshot = copy.deepcopy(base)
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(base, head)
+
+        self.assertEqual(base, base_snapshot)
+
+    def test_array_member_marker_without_id_rejected(self):
+        merger = jsonmerge.Merger(self.ARRAY_SCHEMA)
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(
+                {'items': [{'id': 'A'}]},
+                {'items': [{'foo': 1, '__delete__': None}]})
+
+    def test_array_escape_preserves_marker_like_member(self):
+        merger = jsonmerge.Merger(self.ARRAY_SCHEMA)
+
+        base = merger.merge(
+            {'items': [{'id': 'A'}]},
+            {'items': [{'__escaped__': {'id': 'A',
+                                        '__delete__': None}}]})
+
+        self.assertEqual(base, {'items': [{'id': 'A',
+                                           '__delete__': None}]})
+
+    def test_array_marker_never_leaks_into_output(self):
+        merger = jsonmerge.Merger(self.ARRAY_SCHEMA)
+
+        base = merger.merge(
+            None, {'items': [{'id': 'A', 'field': 1}]})
+        base = merger.merge(
+            base, {'items': [{'id': 'A', '__delete__': None}]})
+
+        for member in base['items']:
+            self.assertNotIn('__delete__', member)
+            self.assertNotIn('__escaped__', member)
+
+    # -- arrayMergeByIndex member deletion -------------------------------
+
+    def test_index_delete_member(self):
+        schema = {
+            'mergeStrategy': 'arrayMergeByIndex',
+            'mergeOptions': {'enableDelete': True},
+        }
+        merger = jsonmerge.Merger(schema)
+
+        base = merger.merge([{'a': 0}], [{'__delete__': None}])
+
+        self.assertEqual(base, [])
+
+    def test_index_delete_missing_strict_raises(self):
+        schema = {
+            'mergeStrategy': 'arrayMergeByIndex',
+            'mergeOptions': {'enableDelete': True, 'strictDelete': True},
+        }
+        merger = jsonmerge.Merger(schema)
+
+        with self.assertRaises(BaseInstanceError):
+            merger.merge([{'a': 0}],
+                         [{'a': 1}, {'__delete__': None}])
+
+    # -- version strategy records deletions in history -------------------
+
+    def test_version_records_tombstone(self):
+        schema = {
+            'mergeStrategy': 'version',
+            'mergeOptions': {'enableDelete': True},
+        }
+        merger = jsonmerge.Merger(schema)
+
+        base = merger.merge(None, 'a')
+        base = merger.merge(base, {'__delete__': None})
+
+        self.assertEqual(base, [{'value': 'a'}, {'deleted': True}])
+
+    def test_version_three_increments_add_delete_reappear(self):
+        schema = {
+            'mergeStrategy': 'version',
+            'mergeOptions': {'enableDelete': True},
+        }
+        merger = jsonmerge.Merger(schema)
+
+        base = merger.merge(None, 'v1')
+        base = merger.merge(base, {'__delete__': None})
+        base = merger.merge(base, 'v2')
+
+        self.assertEqual(base, [
+            {'value': 'v1'},
+            {'deleted': True},
+            {'value': 'v2'},
+        ])
+
+    def test_version_duplicate_tombstone_not_repeated(self):
+        schema = {
+            'mergeStrategy': 'version',
+            'mergeOptions': {'enableDelete': True},
+        }
+        merger = jsonmerge.Merger(schema)
+
+        base = merger.merge(None, {'__delete__': None})
+        base = merger.merge(base, {'__delete__': None})
+
+        self.assertEqual(base, [{'deleted': True}])
+
+    def test_version_tombstone_carries_metadata(self):
+        schema = {
+            'mergeStrategy': 'version',
+            'mergeOptions': {'enableDelete': True},
+        }
+        merger = jsonmerge.Merger(schema)
+        options = {'version': {'metadata': {'rev': 2}}}
+
+        base = merger.merge(None, 'a', merge_options=options)
+        base = merger.merge(base, {'__delete__': None},
+                            merge_options=options)
+
+        self.assertEqual(base, [
+            {'value': 'a', 'rev': 2},
+            {'deleted': True, 'rev': 2},
+        ])
+
+    def test_version_tombstone_respects_limit(self):
+        schema = {
+            'mergeStrategy': 'version',
+            'mergeOptions': {'enableDelete': True, 'limit': 2},
+        }
+        merger = jsonmerge.Merger(schema)
+
+        base = merger.merge(None, 'a')
+        base = merger.merge(base, {'__delete__': None})
+        base = merger.merge(base, 'b')
+
+        self.assertEqual(base, [{'deleted': True}, {'value': 'b'}])
+
+    def test_version_null_is_a_value_not_a_tombstone(self):
+        schema = {
+            'mergeStrategy': 'version',
+            'mergeOptions': {'enableDelete': True},
+        }
+        merger = jsonmerge.Merger(schema)
+
+        base = merger.merge(None, None)
+
+        self.assertEqual(base, [{'value': None}])
+
+    def test_version_escape_records_marker_like_value(self):
+        schema = {
+            'mergeStrategy': 'version',
+            'mergeOptions': {'enableDelete': True},
+        }
+        merger = jsonmerge.Merger(schema)
+
+        base = merger.merge(
+            None, {'__escaped__': {'__delete__': None}})
+
+        self.assertEqual(base, [{'value': {'__delete__': None}}])
+
+
 class TestGetSchema(unittest.TestCase):
 
     def test_default_overwrite(self):
@@ -2643,6 +3018,28 @@ class TestGetSchema(unittest.TestCase):
             merger.merge(base, head)
 
         self.assertIn('arrayMergeByIndex', str(cm.exception))
+
+    def test_version_deleted_property_when_protocol_enabled(self):
+        schema = {
+            'mergeStrategy': 'version',
+            'mergeOptions': {'enableDelete': True},
+        }
+
+        merger = jsonmerge.Merger(schema)
+        schema2 = merger.get_schema()
+
+        self.assertEqual(
+            schema2['items']['properties']['deleted'],
+            {'type': 'boolean'})
+
+    def test_version_no_deleted_property_by_default(self):
+        schema = {'mergeStrategy': 'version'}
+
+        merger = jsonmerge.Merger(schema)
+        schema2 = merger.get_schema()
+
+        self.assertNotIn('deleted', schema2['items']['properties'])
+
 
 class TestExceptions(unittest.TestCase):
     def test_str_with_ref(self):

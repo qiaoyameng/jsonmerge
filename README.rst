@@ -316,6 +316,88 @@ jsonmerge.strategies.Strategy and passing them to Merger() constructor
 (see below).
 
 
+Deleting values during a merge
+------------------------------
+
+By default, *jsonmerge* never removes data: a property or array member
+that is absent from *head* is left untouched in *base*, and an explicit
+*null* in *head* is stored as a literal *null*.  When merging a series
+of incremental documents you sometimes need to say that a value that
+used to exist no longer does.  Because *null* is a legitimate value in
+many data models, *jsonmerge* provides an explicit, opt-in *deletion
+protocol* rather than overloading *null*.
+
+The protocol is enabled per strategy with the *enableDelete* merge
+option.  When it is disabled (the default), the marker objects described
+below are ordinary JSON values and merging behaves exactly as before.
+
+The following schema enables deletion of object members::
+
+    >>> schema = {
+    ...     "mergeStrategy": "objectMerge",
+    ...     "mergeOptions": {"enableDelete": True},
+    ... }
+
+    >>> merger = Merger(schema)
+    >>> base = merger.merge(None, {"keep": 1, "drop": 2})
+    >>> merger.merge(base, {"drop": {"__delete__": None}})
+    {'keep': 1}
+
+An object member is deleted by an object with the single property
+*__delete__*::
+
+    {"__delete__": null}
+
+An *arrayMergeById* member is deleted by an object that carries the item
+ID and the same marker property::
+
+    {"id": "A", "__delete__": null}
+
+For *arrayMergeByIndex*, the position identifies the member, so the plain
+``{"__delete__": null}`` form is used.
+
+A *null* value is never confused with a deletion::
+
+    >>> merger.merge({"a": 1}, {"a": None})
+    {'a': None}
+
+Markers never appear in the merged output.  By default, deleting a
+member that is not present in *base* is a no-op, which makes repeated
+incremental merges idempotent.  Set the *strictDelete* option to make
+such deletions raise an error instead (using *strictDelete* requires
+*enableDelete*).
+
+If your own data legitimately looks like a marker, wrap it in an
+*__escaped__* object to store it verbatim::
+
+    >>> merger.merge(None, {"note": {"__escaped__": {"__delete__": None}}})
+    {'note': {'__delete__': None}}
+
+Malformed markers (for example a *__delete__* property with a non-null
+value, or extra properties) are rejected before any part of the document
+is modified, so a bad *head* can never delete some data and then fail.
+
+With the *version* strategy, a deletion is recorded in the history as a
+tombstone entry with a *deleted* property set to *true* instead of a
+*value* property::
+
+    >>> vschema = {
+    ...     "mergeStrategy": "version",
+    ...     "mergeOptions": {"enableDelete": True},
+    ... }
+    >>> vmerger = Merger(vschema)
+    >>> versioned = vmerger.merge(None, "a")
+    >>> vmerger.merge(versioned, {"__delete__": None})
+    [{'value': 'a'}, {'deleted': True}]
+
+The schema returned by *get_schema()* includes this *deleted* property
+when the protocol is enabled, so the declared schema stays consistent
+with the documents the strategy produces::
+
+    >>> vmerger.get_schema()["items"]["properties"]["deleted"]
+    {'type': 'boolean'}
+
+
 The Merger Class
 ----------------
 
