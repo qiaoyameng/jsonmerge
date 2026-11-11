@@ -2438,6 +2438,167 @@ class TestGetSchema(unittest.TestCase):
 
         self.assertEqual(base, expected)
 
+    def order_constraints_schema(self, options=None):
+        merge_options = {'orderConstraints': True}
+        if options:
+            merge_options.update(options)
+
+        return {
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": merge_options,
+            "items": {
+                "properties": {
+                    "id": {"type": "string"},
+                    "field": {"type": "number"},
+                }
+            }
+        }
+
+    def test_merge_by_id_order_constraints_basic(self):
+        merger = jsonmerge.Merger(self.order_constraints_schema())
+
+        a = [{"id": "B", "field": 1}, {"id": "A", "field": 1}]
+        b = [{"id": "A", "field": 2}, {"id": "C", "field": 1}]
+
+        base, order_state = merger.merge(None, a, order_state={})
+        base, order_state = merger.merge(base, b, order_state=order_state)
+
+        self.assertEqual(
+            [item["id"] for item in base],
+            ["B", "A", "C"])
+
+        # field merges still follow the per-element strategy
+        self.assertEqual(base[1], {"id": "A", "field": 2})
+
+        # every retained constraint is satisfied by the result order
+        from jsonmerge.constraints import OrderConstraints
+        constraints = OrderConstraints.from_state(order_state["#"])
+        positions = dict((id_, i) for i, id_ in enumerate(item["id"] for item in base))
+        for before, after in constraints.edges():
+            self.assertLess(positions[before], positions[after])
+
+    def test_merge_by_id_order_constraints_unrelated_first_occurrence(self):
+        merger = jsonmerge.Merger(self.order_constraints_schema())
+
+        base, order_state = merger.merge(
+            None, [{"id": "Z"}], order_state={})
+        base, order_state = merger.merge(
+            base, [{"id": "Y"}, {"id": "Z"}], order_state=order_state)
+        base, order_state = merger.merge(
+            base, [{"id": "X"}], order_state=order_state)
+
+        # no relation between X, Y, Z: first appearance wins, stably
+        self.assertEqual([item["id"] for item in base], ["Y", "Z", "X"])
+
+    def test_merge_by_id_order_constraints_batching_equivalent(self):
+        # three short arrays that can be merged; regrouping them into
+        # different batches must not change the content or declared order
+        a = [{"id": "B", "field": 1}, {"id": "A", "field": 1}]
+        b = [{"id": "A", "field": 2}, {"id": "C", "field": 1}]
+        c = [{"id": "D", "field": 1}, {"id": "E", "field": 1}]
+
+        # one merge per source array
+        merger_1 = jsonmerge.Merger(self.order_constraints_schema())
+        base_1, state_1 = merger_1.merge(None, a, order_state={})
+        base_1, state_1 = merger_1.merge(base_1, b, order_state=state_1)
+        base_1, state_1 = merger_1.merge(base_1, c, order_state=state_1)
+
+        # last two source arrays grouped into a single batch
+        merger_2 = jsonmerge.Merger(self.order_constraints_schema())
+        base_2, state_2 = merger_2.merge(None, a, order_state={})
+        base_2, state_2 = merger_2.merge(base_2, b + c, order_state=state_2)
+
+        self.assertEqual(base_1, base_2)
+        self.assertEqual(
+            [item["id"] for item in base_1],
+            ["B", "A", "C", "D", "E"])
+
+    def test_merge_by_id_order_constraints_cycle_reports_ids_and_sources(self):
+        from jsonmerge.constraints import OrderConstraintError
+
+        merger = jsonmerge.Merger(self.order_constraints_schema())
+
+        base, order_state = merger.merge(
+            None, [{"id": "A"}, {"id": "B"}], order_state={})
+        base, order_state = merger.merge(
+            base, [{"id": "B"}, {"id": "C"}], order_state=order_state)
+
+        with self.assertRaises(OrderConstraintError) as cm:
+            merger.merge(
+                base, [{"id": "C"}, {"id": "A"}], order_state=order_state)
+
+        error = cm.exception
+        self.assertEqual(error.cycle, ["A", "B", "C", "A"])
+        self.assertEqual(
+            error.sources[("A", "B")], ["merge-0"])
+        self.assertEqual(
+            error.sources[("B", "C")], ["merge-1"])
+        self.assertEqual(
+            error.sources[("C", "A")], ["merge-2"])
+
+    def test_merge_by_id_order_constraints_state_is_required(self):
+        # a previously sorted array cannot be used to reconstruct the
+        # original constraints; without state only this batch's relations
+        # are known
+        merger = jsonmerge.Merger(self.order_constraints_schema())
+
+        base, _ = merger.merge(
+            None, [{"id": "B"}, {"id": "A"}], order_state={})
+
+        # restart without the returned state: B->A must not be retained
+        base, fresh_state = merger.merge(
+            base, [{"id": "A"}, {"id": "C"}], order_state={})
+
+        from jsonmerge.constraints import OrderConstraints
+        constraints = OrderConstraints.from_state(fresh_state["#"])
+        self.assertEqual(list(constraints.edges()), [("A", "C")])
+        # B still precedes A by first appearance; only A->C is enforced
+        self.assertEqual([item["id"] for item in base], ["B", "A", "C"])
+
+    def test_merge_by_id_order_constraints_delete_removes_direct_edges(self):
+        from jsonmerge.constraints import OrderConstraints
+
+        merger = jsonmerge.Merger(self.order_constraints_schema())
+
+        base, order_state = merger.merge(
+            None,
+            [{"id": "A"}, {"id": "B"}, {"id": "C"}],
+            order_state={})
+        base, order_state = merger.merge(
+            base, [{"id": "X"}, {"id": "A"}], order_state=order_state)
+
+        # B is removed from the document outside of jsonmerge
+        base = [item for item in base if item["id"] != "B"]
+
+        base, order_state = merger.merge(
+            base, [{"id": "A"}], order_state=order_state)
+
+        constraints = OrderConstraints.from_state(order_state["#"])
+
+        # only edges mentioning B were removed; no A->C edge fabricated
+        self.assertNotIn(("A", "B"), list(constraints.edges()))
+        self.assertNotIn(("B", "C"), list(constraints.edges()))
+        self.assertNotIn(("A", "C"), list(constraints.edges()))
+        self.assertIn(("X", "A"), list(constraints.edges()))
+        self.assertNotIn("B", constraints.ids())
+
+    def test_merge_by_id_order_constraints_rejects_sortbyref(self):
+        schema = self.order_constraints_schema({"sortByRef": "id"})
+        merger = jsonmerge.Merger(schema)
+
+        with self.assertRaises(SchemaError):
+            merger.merge(None, [{"id": "A"}], order_state={})
+
+        schema = self.order_constraints_schema({"sortReverse": True})
+        with self.assertRaises(SchemaError):
+            jsonmerge.Merger(schema).merge(None, [{"id": "A"}], order_state={})
+
+    def test_merge_by_id_without_order_state_unchanged(self):
+        # backward compatibility: merge() returns the bare document
+        merger = jsonmerge.Merger(self.order_constraints_schema())
+        result = merger.merge(None, [{"id": "A"}])
+        self.assertEqual(result, [{"id": "A"}])
+
 
     def test_merge_append_additional(self):
 

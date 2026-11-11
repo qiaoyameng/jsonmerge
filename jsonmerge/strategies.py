@@ -2,6 +2,7 @@
 from jsonmerge.exceptions import HeadInstanceError, \
                                  BaseInstanceError, \
                                  SchemaError
+from jsonmerge.constraints import OrderConstraints
 from jsonmerge.jsonvalue import JSONValue
 import jsonschema
 import re
@@ -218,11 +219,20 @@ class ArrayMergeById(ArrayStrategy):
 
             yield i, key, item
 
-    def _merge(self, walk, base, head, schema, idRef="id", ignoreId=None, sortByRef=None, sortReverse=None, **kwargs):
+    def _merge(self, walk, base, head, schema, idRef="id", ignoreId=None, sortByRef=None,
+               sortReverse=None, orderConstraints=False, **kwargs):
         subschema = schema.get('items')
 
         if walk.is_type(subschema, "array"):
             raise SchemaError("This strategy is not supported when 'items' is an array", subschema)
+
+        if orderConstraints:
+            if sortByRef is not None or sortReverse is not None:
+                raise SchemaError(
+                    "'orderConstraints' cannot be combined with 'sortByRef' or 'sortReverse'",
+                    schema)
+
+        head_ids = []
 
         for i, key_1, item_1 in self.iter_index_key_item(walk, head, idRef):
             for j, key_2, item_2 in self.iter_index_key_item(walk, head, idRef):
@@ -233,6 +243,9 @@ class ArrayMergeById(ArrayStrategy):
                     break
 
         for i, head_key, head_item in self.iter_index_key_item(walk, head, idRef):
+
+            if orderConstraints and head_key != ignoreId:
+                head_ids.append(head_key)
 
             if head_key == ignoreId:
                 continue
@@ -255,9 +268,61 @@ class ArrayMergeById(ArrayStrategy):
                 j = matching_j[1]
                 raise BaseInstanceError("Id '%s' was not unique in base" % (base_key,), base[j])
 
-        self.sort_array(walk, base, sortByRef, sortReverse)
+        if orderConstraints:
+            constraints = self.get_order_constraints(walk, schema)
+            constraints.add_order(head_ids, self.order_source(walk))
+
+            base_pairs = [(key, item.val)
+                          for i, key, item in self.iter_index_key_item(walk, base, idRef)]
+            base_ids = [key for key, val in base_pairs]
+
+            for gone_id in [id for id in constraints.ids() if id not in base_ids]:
+                constraints.remove(gone_id)
+
+            positions = dict((key, j) for j, key in enumerate(constraints.order(base_ids)))
+            ordered_vals = [val for key, val in sorted(
+                base_pairs, key=lambda pair: positions[pair[0]])]
+
+            # keep items without a resolvable ID in their original places
+            new_val = []
+            for item in base:
+                try:
+                    self.get_key(walk, item, idRef)
+                except jsonschema.RefResolutionError:
+                    new_val.append(item.val)
+                else:
+                    new_val.append(ordered_vals.pop(0))
+            base.val = new_val
+
+            self.set_order_constraints(walk, schema, constraints)
+        else:
+            self.sort_array(walk, base, sortByRef, sortReverse)
 
         return base
+
+    def get_order_constraints(self, walk, schema):
+        state = getattr(walk, 'order_state', None)
+        if state is None:
+            state = {}
+            walk.order_state = state
+
+        key = schema.ref
+        serialized = state.get(key)
+        if serialized is None:
+            return OrderConstraints()
+
+        return OrderConstraints.from_state(serialized)
+
+    def set_order_constraints(self, walk, schema, constraints):
+        if getattr(walk, 'order_state', None) is None:
+            walk.order_state = {}
+
+        walk.order_state[schema.ref] = constraints.to_state()
+
+    def order_source(self, walk):
+        index = getattr(walk, 'order_source_index', 0)
+        walk.order_source_index = index + 1
+        return "merge-%d" % index
 
     def get_schema(self, walk, schema, **kwargs):
         subschema = schema.get('items')

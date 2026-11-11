@@ -267,6 +267,29 @@ arrayMergeById
   *JSON pointer*. The pointer is resolved in the same way as *idRef*. Sort
   order can be reversed by setting the *sortReverse* option.
 
+  Setting the *orderConstraints* merge option to true switches the
+  strategy into a different ordering mode. In this mode the order of the
+  items in each input array is treated as an explicit declaration of
+  before/after relations between their IDs. Relations from every input
+  array are merged together, and the output is ordered so that every
+  declared relation holds. Items that are not related by any constraint
+  keep the order in which they first appeared. This option cannot be
+  combined with *sortByRef* or *sortReverse*; combining them raises a
+  schema error.
+
+  The declared relations cannot be reconstructed from the merged array
+  alone, so in this mode *Merger.merge()* accepts an optional
+  *order_state* argument: pass the constraint state returned by the
+  previous call to carry the relations across a chain of merges. To
+  start a chain, pass an empty dictionary. When *order_state* is given,
+  *merge()* returns a tuple of the merged document and the updated
+  constraint state. If the relations form a cycle, the merge fails with
+  an *OrderConstraintError* that reports the actual IDs in the loop and
+  the sources that declared each edge; no edge is silently dropped.
+  Removing an item from the document only drops the constraints that
+  directly mention it; no new relations are inferred between the
+  remaining items.
+
 arrayMergeByIndex
   Merge array items by their index in the array. Similarly to
   *arrayMergeById* strategy, the resulting arrays have items from both

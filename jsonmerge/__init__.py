@@ -302,19 +302,28 @@ class Merger(object):
 
         self.validator.resolver.store.update(((uri, schema),))
 
-    def merge(self, base, head, meta=None, merge_options=None):
+    def merge(self, base, head, meta=None, merge_options=None, order_state=None):
         """Merge head into base.
 
         base -- Old JSON document you are merging into.
         head -- New JSON document for merging into base.
         merge_options -- Optional dictionary with merge options.
+        order_state -- Optional dictionary with order constraint state.
 
         Keys of merge_options must be names of the strategies. Values must be
         dictionaries of merge options as in the mergeOptions schema element.
         Options in merge_options are applied to all instances of a strategy.
         Values in schema override values given in merge_options.
 
-        Returns an updated base document
+        order_state is only used with the 'orderConstraints' option of the
+        arrayMergeById strategy. It must be the dictionary returned by a
+        previous merge() call in the same chain of merges. The declared
+        order constraints it contains cannot be reconstructed from the
+        merged array alone.
+
+        Returns an updated base document. If order_state is given, returns
+        a tuple of the updated base document and a dictionary with the
+        updated order constraint state.
         """
 
         schema = JSONValue(self.schema)
@@ -338,7 +347,19 @@ class Merger(object):
             merge_options['version'] = { 'metadata': meta }
 
         walk = WalkInstance(self, base, head, merge_options)
-        return walk.descend(schema, base, head).val
+
+        if order_state is not None:
+            walk.order_state = dict(order_state)
+            walk.order_source_index = order_state.get('_next_source_index', 0)
+
+        result = walk.descend(schema, base, head).val
+
+        if order_state is not None:
+            new_state = getattr(walk, 'order_state', {})
+            new_state['_next_source_index'] = getattr(walk, 'order_source_index', 0)
+            return result, new_state
+
+        return result
 
     def get_schema(self, meta=None, merge_options=None):
         """Get JSON schema for the merged document.
