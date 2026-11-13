@@ -361,6 +361,151 @@ validatorclass
     Draft 4 validator is used.
 
 
+Deleting fields and array items
+-------------------------------
+
+An ordinary JSON merge can only add or overwrite data. It can't express
+that a field or an array item that existed in *base* should be removed,
+because a missing property and an explicit ``null`` value are different
+things. *jsonmerge* therefore implements an explicit, opt-in *delete
+protocol*. The protocol is disabled by default and never changes the
+default merge behavior.
+
+The protocol is enabled per strategy with the ``enableDelete`` merge
+option. It is supported by the *objectMerge*, *arrayMergeById* and
+*version* strategies. Requesting it on any other strategy raises a
+*SchemaError* instead of silently leaving control markers in the output.
+
+When the protocol is enabled, two single-property control markers are
+recognized in *head*:
+
+* ``{"$delete": true}`` marks something for removal. The marker itself
+  never appears in the merged document.
+* ``{"$escape": value}`` stores *value* verbatim. Use it when your data
+  literally looks like a marker. The ``$escape`` wrapper is removed and
+  only the escaped value is stored.
+
+Deleting object properties
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+With *objectMerge*, a delete marker placed at a property removes that
+property from the merged object::
+
+    >>> schema = {
+    ...         "mergeStrategy": "objectMerge",
+    ...         "mergeOptions": {"enableDelete": True}
+    ...     }
+    >>> merger = Merger(schema)
+
+    >>> base = merger.merge(None, {"a": 1, "b": 2})
+    >>> pprint(merger.merge(base, {"a": {"$delete": True}}))
+    {'b': 2}
+
+Note how this differs from merging ``null``, which is an ordinary JSON
+value and keeps the property present::
+
+    >>> pprint(merger.merge(base, {"a": None}))
+    {'a': None, 'b': 2}
+
+A previously deleted property can reappear in a later incremental
+document::
+
+    >>> base = merger.merge(base, {"a": {"$delete": True}})
+    >>> pprint(merger.merge(base, {"a": 3}))
+    {'a': 3, 'b': 2}
+
+User data that happens to look like a marker is stored unchanged through
+the escape marker::
+
+    >>> pprint(merger.merge(None, {"a": {"$escape": {"$delete": True}}}))
+    {'a': {'$delete': True}}
+
+By default, deleting a property that doesn't exist is a silent,
+idempotent no-op. Set ``strictDelete`` to ``true`` to raise a
+*HeadInstanceError* instead::
+
+    >>> strict = Merger({
+    ...         "mergeStrategy": "objectMerge",
+    ...         "mergeOptions": {
+    ...             "enableDelete": True,
+    ...             "strictDelete": True
+    ...         }
+    ...     })
+    >>> strict.merge({"a": 1}, {"b": {"$delete": True}})
+    Traceback (most recent call last):
+    ...
+    jsonmerge.exceptions.MarkerError: ...
+
+The keyword used for the delete marker can be changed with the
+``deleteMarker`` merge option. It can't be set to ``$escape``, which is
+always reserved for escaping.
+
+Deleting array items
+~~~~~~~~~~~~~~~~~~~~
+
+With *arrayMergeById*, an array item is deleted by sending a delete
+marker together with the item's ID. The ID is resolved using the
+strategy's *idRef* option (``id`` by default)::
+
+    >>> schema = {
+    ...         "mergeStrategy": "arrayMergeById",
+    ...         "mergeOptions": {"enableDelete": True},
+    ...     }
+    >>> merger = Merger(schema)
+
+    >>> base = merger.merge(None, [
+    ...         {"id": "A", "field": 1},
+    ...         {"id": "B", "field": 2}
+    ...     ])
+    >>> pprint(merger.merge(base, [{"id": "A", "$delete": True}]))
+    [{'field': 2, 'id': 'B'}]
+
+Sending ``null`` for a field instead leaves the item in place and only
+overwrites that field::
+
+    >>> pprint(merger.merge(base, [{"id": "A", "field": None}]))
+    [{'field': None, 'id': 'A'}, {'field': 2, 'id': 'B'}]
+
+A whole array item that literally looks like a marker is preserved with
+the escape marker. The escaped value must still carry the item's ID::
+
+    >>> pprint(merger.merge(None, [
+    ...         {"$escape": {"id": "A", "$delete": True}}
+    ...     ]))
+    [{'$delete': True, 'id': 'A'}]
+
+The same ``strictDelete`` option controls whether deleting an unknown ID
+is an idempotent no-op or an error.
+
+Validation and atomicity
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Control markers are validated before any part of *base* is changed. A
+malformed marker (a flag that is not ``true``, extra properties on a
+marker, or both markers on the same value) or a repeated ID in *head*
+aborts the whole merge, so a merge never partially deletes data and then
+fails.
+
+Deletion and the version strategy
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+With *version*, a delete marker is recorded in history as an entry with
+a ``deleted`` property instead of a ``value`` property::
+
+    >>> schema = {
+    ...         "mergeStrategy": "version",
+    ...         "mergeOptions": {"enableDelete": True}
+    ...     }
+    >>> merger = Merger(schema)
+    >>> base = merger.merge(None, {"x": 1})
+    >>> pprint(merger.merge(base, {"$delete": True}))
+    [{'value': {'x': 1}}, {'deleted': True}]
+
+Accordingly, ``get_schema()`` only advertises the boolean ``deleted``
+property when the protocol is enabled, so the returned schema always
+validates the documents the merger produces.
+
+
 Support for keywords that apply subschemas
 ------------------------------------------
 

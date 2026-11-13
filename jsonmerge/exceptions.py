@@ -23,3 +23,8 @@ class JSONMergeError(Exception):
 class BaseInstanceError(JSONMergeError): pass
 class HeadInstanceError(JSONMergeError): pass
 class SchemaError(JSONMergeError): pass
+
+class MarkerError(HeadInstanceError):
+	"""Raised when a head document contains a malformed delete or escape
+	control marker."""
+	pass

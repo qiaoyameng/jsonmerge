@@ -1,3 +1,21 @@
+2026-11-13	jsonmerge	2.0.0
+
+	* Add an explicit, opt-in delete protocol to the objectMerge,
+	  arrayMergeById and version strategies, enabled with the
+	  "enableDelete" merge option. The "$delete": true marker removes an
+	  object property or an array item identified by its ID, while the
+	  "$escape" marker stores user data that literally looks like a
+	  marker. Markers never appear in merge output and the default merge
+	  behavior is unchanged.
+	* Add the "strictDelete" merge option to make deleting a missing
+	  property or array item raise an error instead of an idempotent
+	  no-op, and the "deleteMarker" option to configure the marker name.
+	* Malformed markers and non-unique head IDs are validated before any
+	  data is modified, so a rejected merge never partially applies.
+	* The version strategy records deletions as entries with a "deleted"
+	  property and get_schema() advertises it only when the protocol is
+	  enabled.
+
 2023-07-19	jsonmerge	1.9.2
 	* Fix failing tests with jsonschema>=4.18.0.
 

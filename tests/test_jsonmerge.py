@@ -9,7 +9,8 @@ import jsonmerge.strategies
 from jsonmerge.exceptions import (
     HeadInstanceError,
     BaseInstanceError,
-    SchemaError
+    SchemaError,
+    MarkerError
 )
 from jsonmerge.jsonvalue import JSONValue
 
@@ -1651,6 +1652,365 @@ class TestMerge(unittest.TestCase):
         result = jsonmerge.merge(base, head, schema)
 
         self.assertEqual(result, [ {'c': 2}, {'d': 3} ])
+
+
+class TestDeleteProtocol(unittest.TestCase):
+
+    def object_merger(self, **extra):
+        options = dict(enableDelete=True)
+        options.update(extra)
+        return jsonmerge.Merger({
+            "mergeStrategy": "objectMerge",
+            "mergeOptions": options,
+        })
+
+    def array_merger(self, **extra):
+        options = dict(enableDelete=True)
+        options.update(extra)
+        return jsonmerge.Merger({
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": options,
+            "items": {
+                "properties": {
+                    "id": {"type": "string"},
+                    "field": {},
+                }
+            }
+        })
+
+    # -- object merge -----------------------------------------------------
+
+    def test_object_three_increments_add_delete_reappear(self):
+        merger = self.object_merger()
+
+        base = merger.merge(None, {"a": 1, "b": 2})
+        self.assertEqual(base, {"a": 1, "b": 2})
+
+        base = merger.merge(base, {"a": {"$delete": True}})
+        self.assertEqual(base, {"b": 2})
+
+        base = merger.merge(base, {"a": 3})
+        self.assertEqual(base, {"b": 2, "a": 3})
+
+    def test_object_delete_differs_from_null(self):
+        merger = self.object_merger()
+
+        deleted = merger.merge({"k": 1}, {"k": {"$delete": True}})
+        self.assertNotIn("k", deleted)
+
+        nulled = merger.merge({"k": 1}, {"k": None})
+        self.assertIn("k", nulled)
+        self.assertIsNone(nulled["k"])
+
+        # Subsequent merges keep the distinction.
+        self.assertEqual(merger.merge(deleted, {"x": 0}), {"x": 0})
+        self.assertEqual(merger.merge(nulled, {"x": 0}),
+                         {"k": None, "x": 0})
+
+    def test_object_missing_delete_is_idempotent_by_default(self):
+        merger = self.object_merger()
+        base = merger.merge({"x": 1}, {"y": {"$delete": True}})
+        self.assertEqual(base, {"x": 1})
+
+    def test_object_missing_delete_is_strict_when_requested(self):
+        merger = self.object_merger(strictDelete=True)
+        with self.assertRaises(HeadInstanceError):
+            merger.merge({"x": 1}, {"y": {"$delete": True}})
+
+    def test_object_markers_never_leak_into_output(self):
+        merger = self.object_merger()
+        base = merger.merge(None, {
+            "a": {"$delete": True},
+            "b": {"$escape": {"$delete": True}},
+        })
+        self.assertEqual(base, {"b": {"$delete": True}})
+
+    def test_object_escape_stores_marker_looking_data_verbatim(self):
+        merger = self.object_merger()
+
+        base = merger.merge(None, {"a": {"$escape": {"$delete": True}}})
+        self.assertEqual(base, {"a": {"$delete": True}})
+
+        # The stored value behaves like ordinary user data afterwards.
+        base = merger.merge(base, {"a": 7})
+        self.assertEqual(base, {"a": 7})
+
+    def test_object_escape_null_and_scalars(self):
+        merger = self.object_merger()
+        base = merger.merge(None, {
+            "a": {"$escape": None},
+            "b": {"$escape": [1, 2]},
+        })
+        self.assertEqual(base, {"a": None, "b": [1, 2]})
+
+    def test_object_custom_marker_name(self):
+        merger = self.object_merger(deleteMarker="__remove__")
+
+        base = merger.merge(None, {"a": 1, "d": {"$delete": True}})
+        base = merger.merge(base, {"a": {"__remove__": True}})
+        self.assertEqual(base, {"d": {"$delete": True}})
+
+    def test_object_reserved_marker_name_rejected(self):
+        merger = self.object_merger(deleteMarker="$escape")
+        with self.assertRaises(SchemaError):
+            merger.merge(None, {"a": 1})
+
+    def test_object_malformed_markers(self):
+        merger = self.object_merger()
+        malformed = [
+            {"a": {"$delete": False}},
+            {"a": {"$delete": 1}},
+            {"a": {"$delete": True, "x": 1}},
+            {"a": {"$delete": True, "$escape": 1}},
+            {"a": {"$escape": 1, "x": 2}},
+        ]
+        for head in malformed:
+            with self.assertRaises(MarkerError):
+                merger.merge({"a": 1}, head)
+
+    def test_marker_error_is_head_instance_error(self):
+        self.assertTrue(issubclass(MarkerError, HeadInstanceError))
+
+    def test_object_malformed_marker_is_atomic(self):
+        merger = self.object_merger()
+        original = {"a": 1, "b": 2}
+        base = dict(original)
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(base, {"a": {"$delete": True},
+                                "b": {"$delete": "not-a-marker"}})
+        self.assertEqual(base, original)
+
+    def test_default_merge_does_not_interpret_markers(self):
+        # No enableDelete anywhere: marker-looking data is plain JSON.
+        base = jsonmerge.merge(None, {"a": {"$delete": True}}, {})
+        self.assertEqual(base, {"a": {"$delete": True}})
+
+        merger = jsonmerge.Merger({"mergeStrategy": "objectMerge"})
+        base = merger.merge({"a": {"keep": 1}},
+                            {"a": {"$delete": True}})
+        # Default objectMerge merges the marker-looking object as ordinary
+        # data (its properties are simply added to the base object).
+        self.assertEqual(base, {"a": {"keep": 1, "$delete": True}})
+
+    def test_nested_object_delete_and_escape(self):
+        schema = {
+            "mergeStrategy": "objectMerge",
+            "mergeOptions": {"enableDelete": True},
+            "properties": {
+                "child": {
+                    "mergeStrategy": "objectMerge",
+                    "mergeOptions": {"enableDelete": True},
+                }
+            }
+        }
+        merger = jsonmerge.Merger(schema)
+
+        base = merger.merge(None, {"child": {"x": 1, "y": 2}, "top": 0})
+        base = merger.merge(base, {"child": {"x": {"$delete": True}}})
+        self.assertEqual(base, {"child": {"y": 2}, "top": 0})
+
+        base = merger.merge(None, {"child": {"$escape": {"x": {"$delete": True}}}})
+        self.assertEqual(base, {"child": {"x": {"$delete": True}}})
+
+    # -- arrayMergeById ---------------------------------------------------
+
+    def test_array_three_increments_add_delete_reappear(self):
+        merger = self.array_merger()
+
+        base = merger.merge(None, [
+            {"id": "A", "field": 1},
+            {"id": "B", "field": 2},
+        ])
+        base = merger.merge(base, [{"id": "A", "$delete": True}])
+        self.assertEqual(base, [{"id": "B", "field": 2}])
+
+        base = merger.merge(base, [{"id": "A", "field": 3}])
+        self.assertEqual(base, [
+            {"id": "B", "field": 2},
+            {"id": "A", "field": 3},
+        ])
+
+    def test_array_null_field_differs_from_item_delete(self):
+        merger = self.array_merger()
+
+        deleted = merger.merge(
+            [{"id": "A", "field": 1}],
+            [{"id": "A", "$delete": True}])
+        self.assertEqual(deleted, [])
+
+        nulled = merger.merge(
+            [{"id": "A", "field": 1}],
+            [{"id": "A", "field": None}])
+        self.assertEqual(nulled, [{"id": "A", "field": None}])
+
+    def test_array_missing_delete_is_idempotent_by_default(self):
+        merger = self.array_merger()
+        base = merger.merge([{"id": "B"}], [{"id": "A", "$delete": True}])
+        self.assertEqual(base, [{"id": "B"}])
+
+    def test_array_missing_delete_is_strict_when_requested(self):
+        merger = self.array_merger(strictDelete=True)
+        with self.assertRaises(HeadInstanceError):
+            merger.merge([{"id": "B"}], [{"id": "A", "$delete": True}])
+
+    def test_array_escape_stores_item_verbatim(self):
+        merger = self.array_merger()
+
+        base = merger.merge(None, [
+            {"$escape": {"id": "A", "$delete": True}}
+        ])
+        self.assertEqual(base, [{"id": "A", "$delete": True}])
+
+        # Escaped item matches by ID and is replaced verbatim.
+        base = merger.merge(
+            [{"id": "A", "field": 1}],
+            [{"$escape": {"id": "A", "field": {"nested": True}}}])
+        self.assertEqual(base, [{"id": "A", "field": {"nested": True}}])
+
+    def test_array_custom_id_ref_delete(self):
+        merger = jsonmerge.Merger({
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": {"enableDelete": True, "idRef": "key"},
+        })
+
+        base = merger.merge(None, [{"key": "A"}, {"key": "B"}])
+        base = merger.merge(base, [{"key": "A", "$delete": True}])
+        self.assertEqual(base, [{"key": "B"}])
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge([{"key": "A"}], [{"$delete": True, "id": "A"}])
+
+    def test_array_compound_id_ref_delete(self):
+        merger = jsonmerge.Merger({
+            "mergeStrategy": "arrayMergeById",
+            "mergeOptions": {"enableDelete": True,
+                             "idRef": ["/a", "/b"]},
+        })
+
+        base = merger.merge(None, [{"a": 1, "b": 2, "v": 1}])
+        base = merger.merge(base, [{"a": 1, "b": 2, "$delete": True}])
+        self.assertEqual(base, [])
+
+    def test_array_malformed_markers(self):
+        merger = self.array_merger()
+        malformed = [
+            [{"$delete": True}],
+            [{"$delete": "yes", "id": "A"}],
+            [{"id": "A", "$delete": True, "field": 9}],
+            [{"$escape": 1, "id": "A"}],
+            [{"$delete": True, "$escape": 1}],
+        ]
+        for head in malformed:
+            with self.assertRaises(HeadInstanceError):
+                merger.merge([{"id": "A", "field": 1}], head)
+
+    def test_array_duplicate_id_rejected_before_any_change(self):
+        merger = self.array_merger()
+        original = [{"id": "A", "field": 1}, {"id": "B", "field": 2}]
+        base = [dict(item) for item in original]
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(base, [
+                {"id": "A", "$delete": True},
+                {"id": "A", "field": 9},
+            ])
+        self.assertEqual(base, original)
+
+    def test_array_malformed_marker_is_atomic(self):
+        merger = self.array_merger()
+        original = [{"id": "A", "field": 1}, {"id": "B", "field": 2}]
+        base = [dict(item) for item in original]
+
+        with self.assertRaises(HeadInstanceError):
+            merger.merge(base, [
+                {"id": "A", "$delete": True},
+                {"id": "B", "$delete": "no"},
+            ])
+        self.assertEqual(base, original)
+
+    def test_array_default_merge_does_not_interpret_markers(self):
+        merger = jsonmerge.Merger({"mergeStrategy": "arrayMergeById"})
+        base = merger.merge(
+            [{"id": "A", "field": 1}],
+            [{"id": "A", "$delete": True}])
+        # Default behavior: the marker is an ordinary property update merged
+        # into the existing item.
+        self.assertEqual(base, [{"id": "A", "field": 1, "$delete": True}])
+
+    # -- version strategy -------------------------------------------------
+
+    def version_merger(self):
+        return jsonmerge.Merger({
+            "mergeStrategy": "version",
+            "mergeOptions": {"enableDelete": True},
+        })
+
+    def test_version_records_delete_in_history(self):
+        merger = self.version_merger()
+        base = merger.merge(None, {"x": 1})
+        base = merger.merge(base, {"$delete": True})
+        base = merger.merge(base, {"x": 2})
+
+        self.assertEqual(base, [
+            {"value": {"x": 1}},
+            {"deleted": True},
+            {"value": {"x": 2}},
+        ])
+
+    def test_version_repeated_delete_is_not_duplicated(self):
+        merger = self.version_merger()
+        base = merger.merge(None, {"$delete": True})
+        base = merger.merge(base, {"$delete": True})
+        self.assertEqual(base, [{"deleted": True}])
+
+    def test_version_escape_stores_literal_marker(self):
+        merger = self.version_merger()
+        base = merger.merge(None, {"$escape": {"$delete": True}})
+        self.assertEqual(base, [{"value": {"$delete": True}}])
+
+    def test_version_get_schema_matches_output(self):
+        merger = self.version_merger()
+
+        schema = merger.get_schema()
+        self.assertEqual(schema, {
+            "type": "array",
+            "items": {
+                "properties": {
+                    "value": {},
+                    "deleted": {"type": "boolean"},
+                }
+            }
+        })
+
+        base = merger.merge(merger.merge(None, 1), {"$delete": True})
+        jsonschema.validate(base, schema)
+
+    def test_version_default_schema_unchanged(self):
+        merger = jsonmerge.Merger({"mergeStrategy": "version"})
+        self.assertEqual(merger.get_schema(), {
+            "type": "array",
+            "items": {"properties": {"value": {}}},
+        })
+
+    def test_version_default_merge_keeps_literal_marker(self):
+        merger = jsonmerge.Merger({"mergeStrategy": "version"})
+        base = merger.merge(None, {"$delete": True})
+        self.assertEqual(base, [{"value": {"$delete": True}}])
+
+    # -- unsupported strategies ------------------------------------------
+
+    def test_unsupported_strategies_reject_protocol(self):
+        for strategy, head in (
+                ("overwrite", 1),
+                ("discard", 1),
+                ("append", [1]),
+                ("arrayMergeByIndex", [1])):
+            merger = jsonmerge.Merger({
+                "mergeStrategy": strategy,
+                "mergeOptions": {"enableDelete": True},
+            })
+            with self.assertRaises(SchemaError):
+                merger.merge(None, head)
 
 
 class TestGetSchema(unittest.TestCase):
