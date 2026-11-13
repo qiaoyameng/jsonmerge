@@ -1,3 +1,20 @@
+2026-11-14	jsonmerge	1.10.0
+	* Add an independent three-way merge entry point
+	  (merge_three_way / ThreeWayMerger) that merges two documents
+	  diverged from a common ancestor and reports structured conflicts
+	  instead of overwriting one side.
+	* Combine unrelated object fields, apply identical edits once and
+	  report different modifications and delete/modify edits with all
+	  three values and JSON pointer paths.
+	* Match array items by identity only when arrayMergeById declares an
+	  explicit idRef; arrays without a stable identity are treated as
+	  whole values. Report duplicate ids as duplicate_id conflicts.
+	* Require strategies to declare three-way capability; reject unknown
+	  or non-capable strategies.
+	* Add conflict resolution by conflict id, rebuilding and re-validating
+	  the whole document. Input documents are never modified and results
+	  are equivalent under a left/right swap when there are no conflicts.
+
 2023-07-19	jsonmerge	1.9.2
 	* Fix failing tests with jsonschema>=4.18.0.
 

@@ -10,6 +10,23 @@ class Strategy(object):
     """Base class for merge strategies.
     """
 
+    # When True, the strategy explicitly declares that it supports three-way
+    # merging (common ancestor plus two independently modified documents).
+    # Custom strategies must opt in by setting this to True and, if they need
+    # custom semantics, by implementing merge_three_way().
+    three_way_capable = False
+
+    def merge_three_way(self, walk, ancestor, left, right, schema,
+                        path=(), **kwargs):
+        """Perform a three-way merge.
+
+        Only invoked for strategies that set three_way_capable to True.
+        The default implementation treats the value at this level as an
+        atomic leaf: equal changes are accepted, any divergent change or a
+        delete-versus-modify is reported as a conflict.
+        """
+        return walk.merge_leaf(ancestor, left, right, path)
+
     def merge(self, walk, base, head, schema, **kwargs):
         """Merge head instance into base.
 
@@ -58,6 +75,8 @@ class Strategy(object):
         return resolved
 
 class Overwrite(Strategy):
+    three_way_capable = True
+
     def merge(self, walk, base, head, schema, **kwargs):
         return head
 
@@ -65,6 +84,8 @@ class Overwrite(Strategy):
         return schema
 
 class Discard(Strategy):
+    # "discard" has no well-defined three-way semantics: it silently favors one
+    # side of a two-way merge. Callers must resolve such values explicitly.
     def merge(self, walk, base, head, schema, keepIfUndef=False, **kwargs):
         if base.is_undef() and keepIfUndef:
             return head
@@ -75,6 +96,8 @@ class Discard(Strategy):
         return schema
 
 class Version(Strategy):
+    # Versioned arrays cannot be reconstructed from a common ancestor without
+    # inventing history entries, so the strategy opts out of three-way merge.
 
     def add_metadata(self, head, metadata):
         if metadata is None:
@@ -191,6 +214,9 @@ class ArrayStrategy(Strategy):
         base.sort(key=key, reverse=bool(sortReverse))
 
 class Append(ArrayStrategy):
+    # Concatenation is not a meaningful three-way operation: an append applied
+    # independently by both sides cannot be distinguished from a duplicated
+    # change without a stable identity.
     def _merge(self, walk, base, head, schema, sortByRef=None, sortReverse=None, **kwargs):
         base.val += head.val
 
@@ -205,6 +231,10 @@ class Append(ArrayStrategy):
         return schema
 
 class ArrayMergeById(ArrayStrategy):
+    # Only this array strategy performs identity-based matching. Note that the
+    # three-way code additionally requires an explicit idRef option: without a
+    # declared identity the array is treated as an atomic value.
+    three_way_capable = True
 
     def get_key(self, walk, item, idRef):
         return self._resolve_ref(walk, item, idRef)
@@ -268,6 +298,9 @@ class ArrayMergeById(ArrayStrategy):
 
 
 class ArrayMergeByIndex(ArrayMergeById):
+    # Positional matching guesses pairing by index and is therefore not
+    # allowed as a three-way identity strategy.
+    three_way_capable = False
 
     def iter_index_key_item(self, walk, jv, idRef):
         for i, item in enumerate(jv):
@@ -300,6 +333,8 @@ class ObjectMerge(Strategy):
 
     objClass -- a name for the class to use as a JSON object in the output.
     """
+    three_way_capable = True
+
     def merge(self, walk, base, head, schema, objclass_menu=None, objClass='_default', **kwargs):
         if not walk.is_type(head, "object"):
             raise HeadInstanceError("Head is not an object", head)

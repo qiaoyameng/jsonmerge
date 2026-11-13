@@ -510,6 +510,127 @@ pull request:
 * Updates *README.rst* to document added functionality.
 
 
+Three-way merge
+---------------
+
+The two-way :func:`jsonmerge.merge` entry point folds a *head* document into
+a *base* document. When two cleaning processes each edit a different part of
+the same JSON document, running an ordinary merge in both directions silently
+overwrites one side of the changes. A three-way merge instead takes the
+common *ancestor* document plus the two divergent documents (*left* and
+*right*) and compares every value against the ancestor.
+
+The independent entry point is :func:`jsonmerge.merge_three_way` (or the
+:class:`jsonmerge.threeway.ThreeWayMerger` class). It returns a
+``ThreeWayMergeResult`` whose ``merged`` attribute holds the merged document
+and whose ``conflicts`` attribute holds a structured list of conflicts. The
+three input documents are never modified.
+
+::
+
+    >>> from jsonmerge import merge_three_way
+    >>> ancestor = {"a": 1, "b": 2}
+    >>> left = {"a": 8, "b": 3, "c": 4}
+    >>> right = {"a": 9, "b": 2}
+    >>> result = merge_three_way(ancestor, left, right)
+    >>> result.merged
+    {'b': 3, 'c': 4}
+    >>> [(c.path, c.conflict_type) for c in result.conflicts]
+    [('/a', 'different_modification')]
+
+Merge semantics
+...............
+
+* Unrelated fields of an object are combined: a field edited only on one
+  side is accepted, and fields added independently on different keys both
+  appear in the result.
+* If both sides make the same change (including the same deletion or the
+  same new value), the change is applied exactly once.
+* If both sides change the same field to different values, a
+  ``different_modification`` conflict is reported with the ancestor, left and
+  right values and a JSON pointer path.
+* If one side deletes a field while the other modifies it, a
+  ``delete_modify`` conflict is reported instead of choosing a side.
+* Conflicting paths are omitted from ``merged``; no input value is ever
+  silently preferred.
+
+Each conflict is exposed both as a :class:`jsonmerge.Conflict` object (with
+the ``MISSING`` sentinel marking an absent value) and as a JSON-serializable
+dictionary through ``conflicts_as_dict()``. The dictionary uses ``null``
+together with ``ancestor_present``, ``left_present`` and ``right_present``
+flags so that an absent path can be distinguished from an explicit JSON
+null.
+
+Arrays
+......
+
+Arrays are never paired by position. An array is treated as one atomic
+value unless its schema declares a stable identity using
+``arrayMergeById`` with an explicit *idRef* merge option::
+
+    schema = {
+        "properties": {
+            "items": {
+                "mergeStrategy": "arrayMergeById",
+                "mergeOptions": {"idRef": "/id"},
+                "items": {"mergeStrategy": "objectMerge"},
+            }
+        }
+    }
+
+Items sharing the same *idRef* value are matched by identity and merged
+field by field. Changing the identity of an item is treated as deleting the
+old identity and adding a new one (a rename), not as editing the id field.
+The *idRef* pointer may be ``/`` to use a scalar array item itself as its
+identity, or an array of pointers for a compound identity.
+
+If a single document contains two items with the same identity, a
+``duplicate_id`` conflict is reported. The ambiguous identity is left out of
+the merged document rather than having one copy preferred over the other.
+Items whose identity cannot be resolved cannot be paired and are kept as
+whole-value additions.
+
+Strategy capability
+...................
+
+Only strategies that explicitly declare three-way support participate. The
+built-in capable strategies are *overwrite* (atomic leaf comparison),
+*objectMerge* and *arrayMergeById* (the latter only with a declared
+*idRef*). The *discard*, *version*, *append* and *arrayMergeByIndex*
+strategies have no unambiguous three-way meaning and are rejected.
+
+A custom strategy opts in by setting ``three_way_capable = True`` and, when
+it needs custom behavior, implementing ``merge_three_way()``. A custom
+strategy without the declaration, or any unknown strategy name, raises a
+``ThreeWayStrategyError`` when the ``ThreeWayMerger`` is constructed.
+
+Resolving conflicts
+...................
+
+Conflicts carry stable string ids. After inspecting them, call
+``ThreeWayMerger.resolve()`` with a mapping of conflict id to the value to
+use. Pass the ``jsonmerge.MISSING`` sentinel to delete the path; an explicit
+``None`` is stored as a JSON null. The document is rebuilt from the original
+inputs from scratch, every unresolved conflict is reported again and, by
+default, the fully resolved document is validated against the JSON schema.
+Unknown conflict ids raise a ``ThreeWayConflictResolutionError``.
+
+::
+
+    >>> from jsonmerge import ThreeWayMerger
+    >>> merger = ThreeWayMerger({})
+    >>> conflict_id = result.conflicts[0].conflict_id
+    >>> resolved = merger.resolve(
+    ...     ancestor, left, right, {conflict_id: 42})
+    >>> resolved.has_conflicts
+    False
+    >>> resolved.merged['a']
+    42
+
+With no conflicts, swapping *left* and *right* produces an equivalent
+result.
+
+
 License
 -------
 

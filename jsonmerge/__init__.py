@@ -5,6 +5,19 @@ from jsonmerge.resolver import LocalRefResolver
 from jsonmerge import strategies
 from jsonmerge import descenders
 from jsonmerge.exceptions import SchemaError, JSONMergeError
+from jsonmerge.threeway import (
+    Conflict,
+    MISSING,
+    ThreeWayMergeResult,
+    ThreeWayMerger,
+    three_way_merge,
+)
+from jsonmerge.threeway_exceptions import (
+    ThreeWayConflictResolutionError,
+    ThreeWayInputError,
+    ThreeWayMergeError,
+    ThreeWayStrategyError,
+)
 from jsonschema.validators import Draft4Validator
 import logging
 import warnings
@@ -384,3 +397,18 @@ def merge(base, head, schema={}):
 
     merger = Merger(schema)
     return merger.merge(base, head)
+
+def merge_three_way(ancestor, left, right, schema=None, strategies=(),
+                    validate=False):
+    """Three-way merge of two documents derived from a common ancestor.
+
+    See :class:`jsonmerge.threeway.ThreeWayMerger` for the semantics. Returns a
+    :class:`ThreeWayMergeResult` containing the merged document and any
+    structured conflicts. Input documents are never modified. When ``validate``
+    is true, a conflict-free result is also checked against the schema.
+    """
+
+    return three_way_merge(
+        ancestor, left, right,
+        schema={} if schema is None else schema,
+        strategies=strategies, validate=validate)
