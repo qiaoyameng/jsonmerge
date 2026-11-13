@@ -475,6 +475,113 @@ Here are some tips for debugging issues with *jsonmerge*:
   product unexpected results.
 
 
+Tracking where each value came from
+-----------------------------------
+
+When several batches of collected JSON documents are merged, it is often
+useful to know which batch contributed any particular value in the final
+document.  Use the *merge_with_provenance* method instead of *merge*::
+
+    >>> import json
+    >>> merger = Merger({
+    ...         "type": "object",
+    ...         "properties": {
+    ...             "title": {"mergeStrategy": "overwrite"},
+    ...             "tags": {"mergeStrategy": "append"},
+    ...             "items": {
+    ...                 "mergeStrategy": "arrayMergeById",
+    ...                 "mergeOptions": {"idRef": "id"},
+    ...                 "items": {"type": "object", "properties": {
+    ...                     "status": {"mergeStrategy": "overwrite"},
+    ...                     "note": {"mergeStrategy": "version"}}}}}})
+
+    >>> batch_1 = {
+    ...         "title": "initial",
+    ...         "tags": ["raw"],
+    ...         "items": [{"id": 1, "status": "new",
+    ...                    "note": "created"}]}
+    >>> batch_2 = {
+    ...         "title": "renamed",
+    ...         "tags": ["fresh"],
+    ...         "items": [{"id": 1, "status": "done",
+    ...                    "note": "finished"}]}
+
+    >>> result = merger.merge_with_provenance(
+    ...         None, batch_1, source_id="batch-1")
+    >>> result = merger.merge_with_provenance(
+    ...         result.merged, batch_2, source_id="batch-2",
+    ...         provenance=result.provenance)
+
+The return value is a *ProvenancedMerge* named tuple.  Its first element,
+*merged*, is exactly what *merge* returns::
+
+    >>> json.dumps(result.merged, sort_keys=True)
+    '{"items": [{"id": 1, "note": [{"value": "created"}, {"value": "finished"}], "status": "done"}], "tags": ["raw", "fresh"], "title": "renamed"}'
+
+The second element, *provenance*, is an independent tree of plain
+JSON-serializable dictionaries.  It mirrors the structure of *merged* and
+records the source of every adopted value::
+
+    >>> def find(node, ref):
+    ...     if node["ref"] == ref:
+    ...         return node
+    ...     for child in node.get("children", []):
+    ...         found = find(child, ref)
+    ...         if found is not None:
+    ...             return found
+
+    >>> find(result.provenance, "#/title")["sources"]
+    ['batch-2']
+    >>> find(result.provenance, "#/tags/0")["sources"]
+    ['batch-1']
+    >>> find(result.provenance, "#/tags/1")["sources"]
+    ['batch-2']
+    >>> find(result.provenance, "#/items/0/status")["sources"]
+    ['batch-2']
+    >>> find(result.provenance,
+    ...      "#/items/0/note/1/value")["sources"]
+    ['batch-2']
+
+Each node contains:
+
+* *ref* - JSON pointer of the value within the merged document.
+* *type* - one of *object*, *array* or *leaf*.  A *leaf* is an adopted
+  scalar or an indivisible custom strategy result.
+* *sources* - identifiers of the heads that contributed this value.
+  Object and array nodes aggregate the sources of their children, while
+  leaves name the head that actually supplied the value.
+* *children* - present on object and array nodes, one entry per property
+  or element, giving field-level and element-level adoption.
+* *history* - present on an overwritten leaf.  It lists the sources that
+  previously held that location, oldest first, so a value replaced by a
+  later batch remains traceable within a bounded history.
+
+Pass the previous *provenance* tree on every call to keep accumulating
+sources across a whole series of batches.  An explicit *source_id* gives
+each head a stable identifier; if it is omitted, one Merger instance
+generates sequential *head-0*, *head-1*, ... identifiers.
+
+Overwritten sources are kept in *history* up to *history_limit* entries
+per leaf (the default is 10).  Setting *history_limit* to 0 disables
+history collection.  Provenance only stores identifiers and structure,
+never references to the caller's input objects: mutating a head after the
+merge cannot change the recorded tree.  A missing key and an explicit
+*null* are handled separately - *null* is a real adopted value, while a
+missing key leaves the previous provenance untouched.
+
+Built-in strategies report the finest adoption they can:
+*overwrite*, *discard*, *objectMerge*, *append*, *arrayMergeById*,
+*arrayMergeByIndex* and *version* all distinguish individual fields or
+elements, and *version* only adds a source entry when the value actually
+changes (duplicate values are not recorded twice).  A custom strategy
+that cannot map its output back to individual inputs is marked as a
+single *leaf* depending on all of its input sources instead of guessing
+one unique source.
+
+The provenance tree is built during the same single merge walk that
+produces *merged*.  No second merge is performed merely to generate the
+explanation.
+
 Reporting bugs and contributing code
 ------------------------------------
 

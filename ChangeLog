@@ -1,3 +1,15 @@
+2026-11-13	jsonmerge	UNRELEASED
+	* Add Merger.merge_with_provenance and the module-level
+	  merge_with_provenance function.  They return the merged document
+	  together with an independent, JSON-serializable provenance tree that
+	  records which head (source id) contributed every adopted value.
+	  Field-level and element-level adoption is tracked for the
+	  overwrite, discard, objectMerge, append, arrayMergeById,
+	  arrayMergeByIndex and version strategies; custom strategies that
+	  cannot report fine-grained adoption are marked as a whole-segment
+	  dependency.  Overwritten sources remain available in a bounded
+	  history.  The regular merge interface and its results are unchanged.
+
 2023-07-19	jsonmerge	1.9.2
 	* Fix failing tests with jsonschema>=4.18.0.
 

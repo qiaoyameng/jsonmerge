@@ -1,5 +1,5 @@
 # vim:ts=4 sw=4 expandtab softtabstop=4
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 from jsonmerge.jsonvalue import JSONValue
 from jsonmerge.resolver import LocalRefResolver
 from jsonmerge import strategies
@@ -10,6 +10,12 @@ import logging
 import warnings
 
 log = logging.getLogger(name=__name__)
+
+#: Result of :meth:`Merger.merge_with_provenance`.
+#:
+#: ``merged`` is exactly what :meth:`Merger.merge` would return.
+#: ``provenance`` is an independent, JSON-serializable source tree.
+ProvenancedMerge = namedtuple('ProvenancedMerge', ['merged', 'provenance'])
 
 #logging.basicConfig(level=logging.DEBUG)
 
@@ -278,6 +284,14 @@ class Merger(object):
 
         self.objclass_menu['_default'] = self.objclass_menu[objclass_def]
 
+        self._next_provenance_id = 0
+
+    def _next_source_id(self, source_id):
+        if source_id is None:
+            source_id = "head-%d" % self._next_provenance_id
+        self._next_provenance_id += 1
+        return source_id
+
     def cache_schema(self, schema, uri=None):
         """Cache an external schema reference.
 
@@ -340,6 +354,59 @@ class Merger(object):
         walk = WalkInstance(self, base, head, merge_options)
         return walk.descend(schema, base, head).val
 
+    def merge_with_provenance(self, base, head, source_id=None,
+            provenance=None, history_limit=10, merge_options=None):
+        """Merge head into base and record the source of every value.
+
+        source_id -- Stable identifier of the head document.  It is stored
+            in the provenance tree next to every value adopted from this
+            head.  If omitted, a per-Merger sequential id is generated.
+        provenance -- Provenance tree returned by a previous call.  Pass it
+            to keep accumulating source information across a series of
+            merges.  When omitted, this call starts a fresh source tree.
+        history_limit -- Maximum number of overwritten-source snapshots kept
+            on each leaf.  Set to 0 to disable history collection.
+        merge_options -- Same as in :meth:`merge`.
+
+        Returns a :class:`ProvenancedMerge` named tuple.  The ``merged``
+        element is identical to the result of the regular :meth:`merge`
+        method.  The ``provenance`` element is a plain JSON-serializable
+        dictionary and does not reference the caller's input objects.
+        """
+
+        schema = JSONValue(self.schema)
+
+        if base is None:
+            base = JSONValue(undef=True)
+        else:
+            base = JSONValue(base)
+
+        head = JSONValue(head)
+
+        if merge_options is None:
+            merge_options = {}
+
+        source_id = self._next_source_id(source_id)
+
+        if provenance is None:
+            tracker = ProvenanceTracker(history_limit=history_limit)
+        else:
+            tracker = ProvenanceTracker(
+                history_limit=history_limit,
+                base_document=None if base.is_undef() else base.val)
+            if provenance:
+                tracker.set_root(PNode.from_dict(provenance))
+
+        walk = ProvenanceWalk(self, base, head, merge_options, source_id, tracker)
+        merged = walk.descend(schema, base, head).val
+
+        if tracker.root is None:
+            source_tree = {}
+        else:
+            source_tree = tracker.root.to_dict()
+
+        return ProvenancedMerge(merged, source_tree)
+
     def get_schema(self, meta=None, merge_options=None):
         """Get JSON schema for the merged document.
 
@@ -384,3 +451,19 @@ def merge(base, head, schema={}):
 
     merger = Merger(schema)
     return merger.merge(base, head)
+
+def merge_with_provenance(base, head, schema={}, source_id=None,
+        provenance=None, history_limit=10):
+    """Merge two JSON documents and return the result with its source tree.
+
+    See :meth:`Merger.merge_with_provenance` for the meaning of the
+    arguments.  Returns a :class:`ProvenancedMerge` named tuple containing
+    the merged document and the independent provenance tree.
+    """
+
+    merger = Merger(schema)
+    return merger.merge_with_provenance(base, head, source_id=source_id,
+            provenance=provenance, history_limit=history_limit)
+
+# Imported last to avoid a circular import (provenance subclasses WalkInstance).
+from jsonmerge.provenance import PNode, ProvenanceWalk, ProvenanceTracker
