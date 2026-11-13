@@ -4,6 +4,9 @@ from jsonmerge.jsonvalue import JSONValue
 from jsonmerge.resolver import LocalRefResolver
 from jsonmerge import strategies
 from jsonmerge import descenders
+from jsonmerge.order_constraints import OrderConstraints, OrderConstraintError, \
+                                        OrderConstraintsState, OrderConstraintState, \
+                                        ConstraintState
 from jsonmerge.exceptions import SchemaError, JSONMergeError
 from jsonschema.validators import Draft4Validator
 import logging
@@ -64,11 +67,46 @@ class Walk(object):
 
             name = schema.val.get("mergeStrategy")
 
-            for v in (
-                    self.merge_options.get(name),
-                    schema.val.get("mergeOptions")):
+            per_call_options = self.merge_options.get(name)
+            schema_options = schema.val.get("mergeOptions")
+
+            for v in (per_call_options, schema_options):
                 if v is not None:
                     opts.update(v)
+
+            # Order constraint state is not a static merge option.  The
+            # caller must carry the state returned by the previous merge, so
+            # even when the schema enables the mode per-call state-related
+            # values take precedence over the schema defaults.
+            if per_call_options is not None:
+                for key in (
+                        'order_constraints_state',
+                        'orderConstraintsState',
+                        'order_constraint_source',
+                        'orderConstraintSource',
+                        'source',
+                        'remove',
+                        'removeIds',
+                        'remove_ids',
+                        'deletedIds',
+                        'deleted_ids',
+                        'deleteIds',
+                        'delete_ids'):
+                    if key in per_call_options:
+                        opts[key] = per_call_options[key]
+
+                for key in ('order_constraints', 'orderConstraints'):
+                    if key not in per_call_options:
+                        continue
+
+                    value = per_call_options[key]
+                    current = opts.get(key)
+                    if isinstance(value, dict) and isinstance(current, dict):
+                        merged_options = dict(current)
+                        merged_options.update(value)
+                        opts[key] = merged_options
+                    else:
+                        opts[key] = value
         else:
             name = None
 
@@ -98,6 +136,8 @@ class WalkInstance(Walk):
         Walk.__init__(self, merger, merge_options)
         self.base_resolver = LocalRefResolver("", base.val)
         self.head_resolver = LocalRefResolver("", head.val)
+        self.order_constraint_states = {}
+        self.order_constraints_enabled = False
 
     def default_strategy(self, schema, base, head, **kwargs):
         log.debug("       : %sdefault strategy" % (self._indent(),))
@@ -302,7 +342,8 @@ class Merger(object):
 
         self.validator.resolver.store.update(((uri, schema),))
 
-    def merge(self, base, head, meta=None, merge_options=None):
+    def merge(self, base, head, meta=None, merge_options=None,
+            return_order_constraints=False):
         """Merge head into base.
 
         base -- Old JSON document you are merging into.
@@ -315,6 +356,12 @@ class Merger(object):
         Values in schema override values given in merge_options.
 
         Returns an updated base document
+
+        If return_order_constraints is true (or the top-level merge option
+        'return_order_constraints' is set), the result is a tuple
+        (document, constraints).  If the document root is an array merged
+        with order constraints, constraints is that array's state.  For
+        nested arrays, constraints maps JSON pointers to state dictionaries.
         """
 
         schema = JSONValue(self.schema)
@@ -329,6 +376,30 @@ class Merger(object):
         if merge_options is None:
             merge_options = {}
 
+        order_option_keys = (
+                'order_constraints',
+                'orderConstraints',
+                'order_constraints_state',
+                'orderConstraintsState',
+                'order_constraint_source',
+                'orderConstraintSource',
+                'source',
+                'remove',
+                'removeIds',
+                'remove_ids',
+                'deletedIds',
+                'deleted_ids',
+                'deleteIds',
+                'delete_ids')
+        if any(key in merge_options for key in order_option_keys):
+            merge_options = dict(merge_options)
+            strategy_options = dict(
+                    merge_options.get('arrayMergeById', {}))
+            for key in order_option_keys:
+                if key in merge_options:
+                    strategy_options[key] = merge_options[key]
+            merge_options['arrayMergeById'] = strategy_options
+
         # backwards compatibility jsonmerge<=1.6.0
         if meta is not None:
             warnings.warn("'meta' argument is deprecated. Please use "
@@ -338,7 +409,69 @@ class Merger(object):
             merge_options['version'] = { 'metadata': meta }
 
         walk = WalkInstance(self, base, head, merge_options)
-        return walk.descend(schema, base, head).val
+        rv = walk.descend(schema, base, head).val
+
+        states = dict(
+                (path, ConstraintState(state.to_dict()))
+                for path, state in walk.order_constraint_states.items())
+
+        self.last_order_constraint_states = states
+        if states and len(states) == 1 and '#' in states:
+            self.last_order_constraint_state = states['#']
+        else:
+            self.last_order_constraint_state = states or None
+
+        wanted = return_order_constraints
+        for key in ('return_order_constraints', 'return_constraints'):
+            if merge_options.get(key):
+                wanted = True
+
+        if wanted:
+            if states and len(states) == 1 and '#' in states:
+                return rv, states['#']
+            return rv, states
+
+        return rv
+
+    def merge_ordered(self, base, head, merge_options=None, source=None,
+            id_ref=None, schema_options=None, state=None,
+            order_constraints=None):
+        """Merge and return (document, order constraint state).
+
+        This is a convenience for a root array using arrayMergeById.  The
+        returned state must be given to the next call; it cannot be
+        reconstructed from the sorted array.
+        """
+        options = {}
+        if merge_options:
+            options.update(merge_options)
+
+        strategy_options = dict(options.get('arrayMergeById', {}))
+        if state is None:
+            state = order_constraints
+        strategy_options['order_constraints'] = (
+                True if state is None else state)
+        if source is not None:
+            strategy_options['source'] = source
+        if id_ref is not None:
+            strategy_options['idRef'] = id_ref
+        if schema_options:
+            strategy_options.update(schema_options)
+        options['arrayMergeById'] = strategy_options
+
+        doc, states = self.merge(
+                base, head, merge_options=options,
+                return_order_constraints=True)
+
+        if isinstance(states, dict) and '#' in states:
+            return doc, states['#']
+        return doc, states
+
+    def merge_with_order_constraints(self, *args, **kwargs):
+        return self.merge_ordered(*args, **kwargs)
+
+    def merge_order_constraints(self, *args, **kwargs):
+        return self.merge_ordered(*args, **kwargs)
 
     def get_schema(self, meta=None, merge_options=None):
         """Get JSON schema for the merged document.
@@ -384,3 +517,22 @@ def merge(base, head, schema={}):
 
     merger = Merger(schema)
     return merger.merge(base, head)
+
+
+def merge_ordered(base, head, schema={}, source=None, id_ref=None,
+        state=None):
+    """Merge arrays by ID while preserving declared ordering constraints.
+
+    Returns a tuple (merged_document, constraint_state).  Pass
+    constraint_state back as the state argument on the next call.
+    """
+    merger = Merger(schema)
+    return merger.merge_ordered(
+            base, head, source=source, id_ref=id_ref, state=state)
+
+
+def merge_with_order_constraints(base, head, schema={}, source=None,
+        id_ref=None, state=None):
+    return merge_ordered(
+            base, head, schema=schema, source=source, id_ref=id_ref,
+            state=state)

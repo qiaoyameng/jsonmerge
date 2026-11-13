@@ -267,6 +267,50 @@ arrayMergeById
   *JSON pointer*. The pointer is resolved in the same way as *idRef*. Sort
   order can be reversed by setting the *sortReverse* option.
 
+  When the order of the items is described by the input arrays themselves,
+  set the *order_constraints* merge option instead of *sortByRef*::
+
+      {
+          "mergeStrategy": "arrayMergeById",
+          "mergeOptions": {
+              "order_constraints": true
+          }
+      }
+
+  In this mode every input array contributes its declared ordering
+  relationships. Items that are related by an input array keep that
+  relative order. Items with no ordering relationship are placed in the
+  order in which they first occur. The order is computed after all content
+  merging, so items that describe the same ID are still merged using the
+  strategy specified for the array items.
+
+  The mode does not only return the merged array. It also returns a
+  serializable constraint state that must be passed to the next merge::
+
+      merger = jsonmerge.Merger(schema)
+
+      result, state = merger.merge_ordered(None, source_a)
+      result, state = merger.merge_ordered(result, source_b, state=state)
+      result, state = merger.merge_ordered(result, source_c, state=state)
+
+  The state is also available through the *last_order_constraint_state*
+  attribute after a normal *merge()* call. State can be supplied with the
+  *order_constraints* option or with a separate
+  *order_constraints_state* option. A previously sorted array must not be
+  used to reconstruct the state: sorting has already lost the distinction
+  between declared relationships and arbitrary tie-breaking.
+
+  If the collected relationships contain a cycle, the merge fails with an
+  error naming the actual ID cycle and the source arrays that contributed
+  each relationship. No edge is discarded to produce an arbitrary order.
+
+  Members can be removed by supplying *remove*, *removeIds*, *remove_ids*,
+  *deletedIds*, *deleted_ids*, *deleteIds* or *delete_ids* with the
+  constraint state. Only relationships that touch a removed member are
+  removed; its predecessor and successor are not implicitly connected.
+  *order_constraints* cannot be combined with *sortByRef* or
+  *sortReverse*.
+
 arrayMergeByIndex
   Merge array items by their index in the array. Similarly to
   *arrayMergeById* strategy, the resulting arrays have items from both

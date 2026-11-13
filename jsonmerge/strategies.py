@@ -3,8 +3,12 @@ from jsonmerge.exceptions import HeadInstanceError, \
                                  BaseInstanceError, \
                                  SchemaError
 from jsonmerge.jsonvalue import JSONValue
+from jsonmerge.order_constraints import OrderConstraints, \
+                                       OrderConstraintError, \
+                                       canonical_id
 import jsonschema
 import re
+import json
 
 class Strategy(object):
     """Base class for merge strategies.
@@ -218,19 +222,246 @@ class ArrayMergeById(ArrayStrategy):
 
             yield i, key, item
 
-    def _merge(self, walk, base, head, schema, idRef="id", ignoreId=None, sortByRef=None, sortReverse=None, **kwargs):
+    def _looks_like_order_state(self, value):
+        if not isinstance(value, dict):
+            return False
+
+        return any(key in value for key in (
+                '_order_constraints',
+                'first_seen',
+                'firstSeen',
+                'edges',
+                'constraints',
+                'seen',
+                'order',
+                'ids'))
+
+    def _normalize_removed_ids(self, value):
+        if value is None:
+            return []
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, list):
+            return value
+        return [value]
+
+    def _order_options(self, order_constraints, order_constraints_state,
+            order_constraint_source, source, removed, **kwargs):
+        enabled = False
+        prior = False
+        state = None
+        target = None
+        source_name = order_constraint_source if order_constraint_source is not None else source
+        base_source = 'base'
+        removed_ids = list(removed)
+
+        if source_name is None:
+            source_name = 'head'
+
+        if order_constraints is None and kwargs.get('orderConstraints') is not None:
+            order_constraints = kwargs.get('orderConstraints')
+        if order_constraints_state is None and kwargs.get('orderConstraintsState') is not None:
+            order_constraints_state = kwargs.get('orderConstraintsState')
+        if order_constraint_source is None and kwargs.get('orderConstraintSource') is not None:
+            order_constraint_source = kwargs.get('orderConstraintSource')
+
+        if order_constraints_state is not None:
+            enabled = True
+            prior = True
+            if isinstance(order_constraints_state, OrderConstraints):
+                state = order_constraints_state
+            else:
+                state = OrderConstraints.from_dict(order_constraints_state)
+                if isinstance(order_constraints_state, dict):
+                    target = order_constraints_state
+
+        if order_constraints is None or order_constraints is False:
+            return {
+                'enabled': enabled,
+                'prior': prior,
+                'state': state,
+                'target': target,
+                'source': source_name,
+                'base_source': base_source,
+                'removed': removed_ids,
+            }
+
+        if isinstance(order_constraints, str):
+            try:
+                parsed = json.loads(order_constraints)
+            except ValueError:
+                parsed = None
+
+            if isinstance(parsed, dict) and self._looks_like_order_state(parsed):
+                enabled = True
+                prior = True
+                if state is None:
+                    state = OrderConstraints.from_dict(parsed)
+                return {
+                    'enabled': enabled,
+                    'prior': prior,
+                    'state': state,
+                    'target': target,
+                    'source': source_name,
+                    'base_source': base_source,
+                    'removed': removed_ids,
+                }
+
+        if isinstance(order_constraints, OrderConstraints):
+            enabled = True
+            prior = True
+            if state is None:
+                state = order_constraints
+            return {
+                'enabled': enabled,
+                'prior': prior,
+                'state': state,
+                'target': target,
+                'source': source_name,
+                'base_source': base_source,
+                'removed': removed_ids,
+            }
+
+        if isinstance(order_constraints, dict):
+            if self._looks_like_order_state(order_constraints):
+                enabled = True
+                prior = True
+                if state is None:
+                    state = OrderConstraints.from_dict(order_constraints)
+                target = order_constraints
+                return {
+                    'enabled': enabled,
+                    'prior': prior,
+                    'state': state,
+                    'target': target,
+                    'source': source_name,
+                    'base_source': base_source,
+                    'removed': removed_ids,
+                }
+
+            enabled = order_constraints.get('enabled', True)
+            nested_state = (
+                    order_constraints.get('state')
+                    or order_constraints.get('constraints_state')
+                    or order_constraints.get('order_constraints_state'))
+
+            if nested_state is not None:
+                enabled = True
+                prior = True
+                if isinstance(nested_state, OrderConstraints):
+                    state = nested_state
+                else:
+                    state = OrderConstraints.from_dict(nested_state)
+                    if isinstance(nested_state, dict):
+                        target = nested_state
+
+            if order_constraints.get('source') is not None:
+                source_name = order_constraints.get('source')
+            if order_constraints.get('base_source') is not None:
+                base_source = order_constraints.get('base_source')
+
+            for key in ('remove', 'removeId', 'removeIds', 'remove_ids',
+                        'deletedIds', 'deleted_ids',
+                        'deleteId', 'deleteIds', 'delete_ids',
+                        'dropId', 'dropIds', 'drop_ids'):
+                if key in order_constraints:
+                    removed_ids.extend(self._normalize_removed_ids(
+                            order_constraints.get(key)))
+
+            if enabled and state is None:
+                state = OrderConstraints()
+                if not order_constraints:
+                    target = order_constraints
+
+            return {
+                'enabled': enabled,
+                'prior': prior,
+                'state': state,
+                'target': target,
+                'source': source_name,
+                'base_source': base_source,
+                'removed': removed_ids,
+            }
+
+        enabled = True
+        if state is None:
+            state = OrderConstraints()
+        if isinstance(order_constraints, str) and source_name is None:
+            source_name = order_constraints
+
+        return {
+            'enabled': enabled,
+            'prior': prior,
+            'state': state,
+            'target': target,
+            'source': source_name,
+            'base_source': base_source,
+            'removed': removed_ids,
+        }
+
+    def _validate_unique_ids(self, walk, jv, idRef, error_cls, type_aware):
+        seen = {}
+
+        for i, key, item in self.iter_index_key_item(walk, jv, idRef):
+            token = canonical_id(key) if type_aware else key
+            if token in seen:
+                raise error_cls(
+                        "Id '%s' was not unique" % (key,), item)
+            seen[token] = i
+
+    def _merge(self, walk, base, head, schema, idRef="id", ignoreId=None,
+            sortByRef=None, sortReverse=None, order_constraints=None,
+            order_constraints_state=None, order_constraint_source=None,
+            source=None, remove=None, removeIds=None, remove_ids=None,
+            removeId=None, dropId=None, dropIds=None, drop_ids=None,
+            deletedIds=None, deleted_ids=None, deleteIds=None,
+            delete_ids=None, deleteId=None, **kwargs):
         subschema = schema.get('items')
 
         if walk.is_type(subschema, "array"):
             raise SchemaError("This strategy is not supported when 'items' is an array", subschema)
 
-        for i, key_1, item_1 in self.iter_index_key_item(walk, head, idRef):
-            for j, key_2, item_2 in self.iter_index_key_item(walk, head, idRef):
-                if j < i:
-                    if key_1 == key_2:
-                        raise HeadInstanceError("Id '%s' was not unique in head" % (key_1,), item_1)
-                else:
-                    break
+        removed = []
+        for value in (remove, removeId, removeIds, remove_ids,
+                      dropId, dropIds, drop_ids,
+                      deletedIds, deleted_ids,
+                      deleteId, deleteIds, delete_ids):
+            removed.extend(self._normalize_removed_ids(value))
+
+        options = self._order_options(
+                order_constraints,
+                order_constraints_state,
+                order_constraint_source,
+                source,
+                removed,
+                **kwargs)
+
+        if options['enabled'] and (sortByRef is not None or sortReverse is not None):
+            raise OrderConstraintError(
+                    "'order_constraints' cannot be combined with 'sortByRef' "
+                    "or 'sortReverse'",
+                    value=schema)
+
+        type_aware = options['enabled']
+
+        if type_aware:
+            self._validate_unique_ids(
+                    walk, head, idRef, HeadInstanceError, True)
+            self._validate_unique_ids(
+                    walk, base, idRef, BaseInstanceError, True)
+        else:
+            for i, key_1, item_1 in self.iter_index_key_item(walk, head, idRef):
+                for j, key_2, item_2 in self.iter_index_key_item(walk, head, idRef):
+                    if j < i:
+                        if key_1 == key_2:
+                            raise HeadInstanceError("Id '%s' was not unique in head" % (key_1,), item_1)
+                    else:
+                        break
+
+        original_base_ids = []
+        if type_aware:
+            for i, key, item in self.iter_index_key_item(walk, base, idRef):
+                original_base_ids.append(key)
 
         for i, head_key, head_item in self.iter_index_key_item(walk, head, idRef):
 
@@ -240,7 +471,8 @@ class ArrayMergeById(ArrayStrategy):
             matching_j = []
             for j, base_key, base_item in self.iter_index_key_item(walk, base, idRef):
 
-                if base_key == head_key:
+                if (canonical_id(base_key) == canonical_id(head_key)
+                        if type_aware else base_key == head_key):
                     matching_j.append(j)
                     matched_item = base_item
 
@@ -255,9 +487,106 @@ class ArrayMergeById(ArrayStrategy):
                 j = matching_j[1]
                 raise BaseInstanceError("Id '%s' was not unique in base" % (base_key,), base[j])
 
-        self.sort_array(walk, base, sortByRef, sortReverse)
+        if not options['enabled']:
+            self.sort_array(walk, base, sortByRef, sortReverse)
+            return base
+
+        state = options['state']
+
+        removed_tokens = set(
+                canonical_id(item_id)
+                for item_id in options['removed'])
+        kept_base_ids = [
+            key for key in original_base_ids
+            if canonical_id(key) not in removed_tokens
+        ]
+
+        if options['removed']:
+            base.val = [
+                item.val for item in base
+                if not self._item_has_token(walk, item, idRef, removed_tokens)
+            ]
+
+            for item_id in options['removed']:
+                state.remove(item_id)
+
+        if not options['prior']:
+            state.add_order(kept_base_ids, source=options['base_source'])
+        else:
+            # A prior state is authoritative.  Do not recreate constraints
+            # from the order of an already sorted base array.  Newly seen
+            # base members are still registered so that they are not lost.
+            for key in kept_base_ids:
+                state.add_id(key)
+
+        head_ids = []
+        head_token_to_item = {}
+        for i, key, item in self.iter_index_key_item(walk, head, idRef):
+            if key == ignoreId:
+                continue
+            token = canonical_id(key)
+            if token in head_token_to_item:
+                # Duplicate IDs were checked above.  Keeping this guard makes
+                # the invariant explicit if a subclass changes get_key().
+                raise HeadInstanceError(
+                        "Id '%s' was not unique in head" % (key,), item)
+            head_token_to_item[token] = item
+            head_ids.append(key)
+
+        state.add_order(head_ids, source=options['source'])
+
+        ordered_ids = state.order()
+
+        item_map = {}
+        idless = []
+        remaining = []
+        for i, item in enumerate(base):
+            try:
+                key = self.get_key(walk, item, idRef)
+            except jsonschema.RefResolutionError:
+                idless.append(item.val)
+                continue
+
+            token = canonical_id(key)
+            if token in item_map:
+                raise BaseInstanceError(
+                        "Id '%s' was not unique in base" % (key,), item)
+            item_map[token] = item.val
+            remaining.append(token)
+
+        ordered_tokens = set()
+        ordered_items = list(idless)
+        for item_id in ordered_ids:
+            token = canonical_id(item_id)
+            if token in item_map:
+                ordered_items.append(item_map[token])
+                ordered_tokens.add(token)
+
+        # Keep any member that was not represented in the state (for
+        # example a member with an ID type that the caller changed between
+        # calls).  Its position is its first occurrence in the current base.
+        for token in remaining:
+            if token not in ordered_tokens:
+                ordered_items.append(item_map[token])
+
+        base.val = ordered_items
+
+        if options['target'] is not None:
+            serialized = state.to_dict()
+            options['target'].clear()
+            options['target'].update(serialized)
+
+        walk.order_constraint_states[base.ref] = state
+        walk.order_constraints_enabled = True
 
         return base
+
+    def _item_has_token(self, walk, item, idRef, tokens):
+        try:
+            key = self.get_key(walk, item, idRef)
+        except jsonschema.RefResolutionError:
+            return False
+        return canonical_id(key) in tokens
 
     def get_schema(self, walk, schema, **kwargs):
         subschema = schema.get('items')
