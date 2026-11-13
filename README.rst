@@ -206,6 +206,45 @@ Note that because of the *version* strategy, the type of the *foo* field
 changed from *object* to *array*.
 
 
+Migrating documents between schemas
+-----------------------------------
+
+When the merge schema itself evolves - say a field that used the
+*version* strategy should now use *objectMerge* - existing merge
+products no longer match the structure the new schema expects.  Simply
+swapping the schema would make the merger interpret old historical
+structures (like version arrays) as new business values.
+
+The *jsonmerge.migration* module builds an explicit migration plan from
+the old schema, the new schema and an existing merge product::
+
+    from jsonmerge.migration import plan_migration
+
+    plan = plan_migration(old_schema, new_schema, document,
+                          select_versions={'/config': 0})
+    print(plan.summary())
+    plan.approve()
+    document = plan.apply(document)
+
+The plan identifies every path whose strategy or key options (such as
+*idRef* for *arrayMergeById*) changed.  Automatic steps are only
+generated for unambiguous conversions: collapsing a *version* array to
+one explicitly selected entry.  The caller must name the entry by index
+- the plan never silently picks the last version to mask a business
+decision.  All other changes require a caller-provided transform
+function via the *transforms* argument.  Changes without a decision
+stay pending and block approval.
+
+The plan records digests of the old schema and the document plus a
+description of the history each step discards.  It must be approved
+before use, expires after a configurable TTL (*ttl_seconds*) and only
+applies to the exact document it was planned for.  On any failure
+*apply()* raises and never returns a half-migrated object.  The
+migrated document is validated against the schema produced by
+*get_schema()* for the new merge schema, so the next *merge()* call can
+continue with it directly.
+
+
 Merge strategies
 ----------------
 
